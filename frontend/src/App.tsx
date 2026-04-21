@@ -1,164 +1,19 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { api, apiBlob, resolveApiUrl } from "./api";
-
-type SessionState = "DRAFT_TAB1" | "LOCKING" | "ACTIVE" | "SUMMARIZING" | "ENDED" | "NARRATING" | "RESETTING";
-
-type Catalog = {
-  preset_id: string;
-  preset_name: string;
-  map_image_url: string;
-  adventure_selection_image_url: string;
-  default_image_url: string;
-  adventures: Adventure[];
-  players: PlayerCatalog[];
-  classes: ClassCatalog[];
-  monsters: Monster[];
-};
-
-type Adventure = {
-  adventure_id: string;
-  title: string;
-  description: string;
-  objectives: Array<{ id: string; description: string; status: string }>;
-  monsters: string[];
-  map_image_url: string;
-  locations: AdventureLocation[];
-};
-
-type AdventureLocation = {
-  id: string;
-  number: number;
-  title: string;
-  description: string;
-  x_pct: number;
-  y_pct: number;
-};
-
-type PlayerCatalog = {
-  player_id: string;
-  name: string;
-  archetype: string;
-  gender: string;
-  race: string;
-  irl_job: string;
-  keywords: string[];
-  display_text: string;
-  image_url: string;
-};
-
-type ClassCatalog = {
-  class_id: string;
-  name: string;
-  role: string;
-  armor_class: number;
-  hp_max: number;
-};
-
-type Monster = {
-  monster_id: string;
-  ac: number;
-  hp: number;
-  attack_bonus: number;
-  attack_text: string;
-  image_url: string;
-};
-
-type CombatState = {
-  in_combat: boolean;
-  round: number;
-  turn_index: number;
-  initiative_order: string[];
-  initiative_values: Record<string, number>;
-};
-
-type OppositionMonsterInstance = {
-  monster_id: string;
-  display_name: string;
-  current_hp: number;
-  hp_max: number;
-  is_dead: boolean;
-  status_effects: string[];
-};
-
-type OppositionState = {
-  active: boolean;
-  group_id: string;
-  initiative_id: string;
-  monster_type: string;
-  monster_stats: Record<string, unknown>;
-  instances: OppositionMonsterInstance[];
-};
-
-type PartyMember = {
-  slot: number;
-  player_id: string;
-  player_name: string;
-  class_id: string;
-  portrait_url: string;
-  base_portrait_url: string;
-  race: string;
-  archetype: string;
-  keywords: string[];
-  armor_class: number;
-  hp_max: number;
-  hp_current: number;
-  status_effects: string[];
-  inventory: string[];
-  initiative: number | null;
-};
-
-type SessionDetail = {
-  session: {
-    session_id: string;
-    state: SessionState;
-    prompt_index: number;
-    last_summarized_prompt_index: number;
-    tab1_locked: boolean;
-    combat_state: CombatState;
-    selected_narrative_player_id: string;
-    opposition_state?: OppositionState | null;
-  };
-  tab1: {
-    preset_id: string;
-    adventure_id: string;
-    selected_player_ids: string[];
-    class_assignments: Record<number, string>;
-    selected_agent_slots: number[];
-    agent_names: Record<number, string>;
-    tab1_locked: boolean;
-    party: PartyMember[];
-    active_adventure: Adventure | null;
-  };
-  events: Array<{
-    event_id: string;
-    prompt_index: number;
-    role: "user" | "agent" | "system";
-    kind: string;
-    agent_slot: number | null;
-    text: string;
-    json_payload: Record<string, unknown>;
-    created_at: string;
-  }>;
-  memory_blocks: Array<{
-    block_id: string;
-    type: string;
-    from_prompt_index: number;
-    to_prompt_index: number;
-    json_payload: Record<string, unknown>;
-  }>;
-  narrative_drafts: Array<{ draft_id: string; chapter_text: string }>;
-  image_state: { image_url: string; prompt_text: string; last_actor_slot: number | null };
-  gm_monsters: Monster[];
-};
-
-const SLOT_COLORS: Record<number, string> = {
-  1: "#f56f7e",
-  2: "#ff9e4a",
-  3: "#f4cf59",
-  4: "#60d48f",
-  12: "#69b7ff",
-};
-const OPPOSITION_SLOT = 12;
+import {
+  Adventure,
+  AdventureSummary,
+  CatalogBoot,
+  FeedbackCreateResponse,
+  Monster,
+  OPPOSITION_SLOT,
+  PromptResponse,
+  SessionDetail,
+  TtsState,
+} from "./appTypes";
+import { AdventureTab } from "./components/AdventureTab";
+import { FeedbackTab } from "./components/FeedbackTab";
+import { PreparationTab } from "./components/PreparationTab";
 
 const MUSIC_TRACKS = [
   "Citadel of Rusted Banners (1).mp3",
@@ -167,6 +22,7 @@ const MUSIC_TRACKS = [
   "Cursed Village Menu.mp3",
   "Gallows of the Forgotten King.mp3",
 ].map((fileName) => resolveApiUrl(`/music/${encodeURIComponent(fileName)}`));
+
 const ADVENTURE_TITLE_OVERRIDES: Record<string, string> = {
   "icebane-castle": "Memories of the Witch King",
   "east-marsh-raid": "Blood at Midnight",
@@ -175,11 +31,24 @@ const ADVENTURE_TITLE_OVERRIDES: Record<string, string> = {
   "collecting-taxes": "Collecting What's Owed",
   "endless-glacier-undead": "Nightmares of the Thawed",
 };
+
 const TTS_STATUS_LABELS = {
   idle: "Idle",
   loading: "Loading",
   playing: "Playing",
-} as const;
+} as const satisfies Record<TtsState, string>;
+
+const MUSIC_VOLUME = 0.015;
+const TTS_PLAYER_GAIN: Record<string, number> = {
+  Beau: 1,
+  Joe: 1,
+  Annie: 1.05,
+  Rick: 1.05,
+  Sam: 1.05,
+  Tom: 1.05,
+  Tammey: 1.35,
+  Jannet: 1.35,
+};
 
 function sanitizeVisibleAgentText(text: string) {
   return text
@@ -196,21 +65,59 @@ function sanitizeVisibleAgentText(text: string) {
     .trim();
 }
 
-const MUSIC_VOLUME = 0.1;
-const TTS_PLAYER_GAIN: Record<string, number> = {
-  Beau: 1,
-  Joe: 1,
-  Annie: 1.05,
-  Rick: 1.05,
-  Sam: 1.05,
-  Tom: 1.05,
-  Tammey: 1.35,
-  Jannet: 1.35,
-};
+function orderedAgentSlotsForDetail(detail: SessionDetail | null): number[] {
+  if (!detail) return [1, 2, 3, 4];
+  if (detail.session.combat_state.in_combat) {
+    return detail.session.combat_state.initiative_order
+      .map((item) => {
+        if (item === "opp:12") return OPPOSITION_SLOT;
+        if (item.startsWith("pc:")) return Number(item.replace("pc:", ""));
+        return Number(item);
+      })
+      .filter((slot) => Number.isFinite(slot));
+  }
+  return detail.tab1.selected_agent_slots;
+}
+
+function selectableAgentSlotsForDetail(detail: SessionDetail | null): number[] {
+  if (!detail) return [1, 2, 3, 4];
+  const playerSlots = detail.tab1.party.filter((member) => member.hp_current > 0).map((member) => member.slot);
+  const activeOrder = orderedAgentSlotsForDetail(detail).filter((slot) => slot !== OPPOSITION_SLOT);
+  const orderedPlayers = activeOrder.filter((slot) => playerSlots.includes(slot));
+  const remainingPlayers = playerSlots.filter((slot) => !orderedPlayers.includes(slot));
+  const oppositionSlots = detail.session.opposition_state?.active ? [OPPOSITION_SLOT] : [];
+  return [...orderedPlayers, ...remainingPlayers, ...oppositionSlots];
+}
+
+function nextSelectableSlot(detail: SessionDetail | null, currentSlot: number): number {
+  const slots = selectableAgentSlotsForDetail(detail);
+  if (!slots.length) return 1;
+  const currentIndex = slots.indexOf(currentSlot);
+  if (currentIndex === -1) return slots[0];
+  return slots[(currentIndex + 1) % slots.length];
+}
+
+function firstMonsterId(monsters: Monster[]) {
+  return monsters[0]?.monster_id ?? "";
+}
+
+function locationImageSlug(name: string) {
+  return name
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u2018\u2019']/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function locationImageUrl(title: string) {
+  const slug = locationImageSlug(title);
+  return `/assets/Location-${slug}.webp`;
+}
 
 export function App() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
-  const transcriptRef = useRef<HTMLDivElement | null>(null);
+  const transcriptRef = useRef<HTMLDivElement>(null);
   const speechAudioRef = useRef<HTMLAudioElement | null>(null);
   const speechAudioContextRef = useRef<AudioContext | null>(null);
   const speechGainNodeRef = useRef<GainNode | null>(null);
@@ -218,17 +125,19 @@ export function App() {
   const speechObjectUrlRef = useRef<string | null>(null);
   const speechAbortRef = useRef<AbortController | null>(null);
   const autoPlayBaselineRef = useRef<string | null>(null);
-  const [catalog, setCatalog] = useState<Catalog | null>(null);
+  const narrationPollTokenRef = useRef(0);
+
+  const [catalogBoot, setCatalogBoot] = useState<CatalogBoot | null>(null);
+  const [adventureDetailsById, setAdventureDetailsById] = useState<Record<string, Adventure>>({});
   const [sessionId, setSessionId] = useState("");
   const [detail, setDetail] = useState<SessionDetail | null>(null);
   const [tab, setTab] = useState<1 | 2 | 3>(1);
   const [loading, setLoading] = useState(false);
   const [chapterStarting, setChapterStarting] = useState(false);
   const [chapterLoadingFrame, setChapterLoadingFrame] = useState(0);
-  const [imageLoading, setImageLoading] = useState(false);
-  const [narrativeBuilding, setNarrativeBuilding] = useState(false);
+  const [feedbackSubmitting, setFeedbackSubmitting] = useState(false);
+  const [feedbackSubmittedAt, setFeedbackSubmittedAt] = useState("");
   const [error, setError] = useState("");
-  const [adventurePickerOpen, setAdventurePickerOpen] = useState(false);
   const [trackIndex, setTrackIndex] = useState(0);
   const [musicPlaying, setMusicPlaying] = useState(false);
   const [musicMuted, setMusicMuted] = useState(false);
@@ -236,29 +145,101 @@ export function App() {
   const [selectedPlayerIds, setSelectedPlayerIds] = useState<string[]>([]);
   const [classByPlayer, setClassByPlayer] = useState<Record<string, string>>({});
   const [activeAgentSlot, setActiveAgentSlot] = useState(1);
-  const [activeMonsterCardIndex, setActiveMonsterCardIndex] = useState(0);
   const [activeLocationId, setActiveLocationId] = useState("");
   const [userPrompt, setUserPrompt] = useState("");
-  const [selectedNarrativePlayerId, setSelectedNarrativePlayerId] = useState("");
   const [ttsAutoPlay, setTtsAutoPlay] = useState(false);
-  const [ttsState, setTtsState] = useState<"idle" | "loading" | "playing">("idle");
+  const [ttsState, setTtsState] = useState<TtsState>("idle");
   const [ttsError, setTtsError] = useState("");
   const [travelLoading, setTravelLoading] = useState(false);
   const [longRestLoading, setLongRestLoading] = useState(false);
-  const [oppositionQuantity, setOppositionQuantity] = useState(1);
+  const [encounterModalOpen, setEncounterModalOpen] = useState(false);
+  const [encounterMonsterId, setEncounterMonsterId] = useState("");
+  const [encounterQuantity, setEncounterQuantity] = useState(1);
   const [spawnLoading, setSpawnLoading] = useState(false);
   const [dismissLoading, setDismissLoading] = useState(false);
+  const [feedbackText, setFeedbackText] = useState("");
+  const [locationView, setLocationView] = useState<"world" | "adventure" | "encounter">("world");
+  const [encounterLocationTitle, setEncounterLocationTitle] = useState("Antlers Rest Inn");
+  const [playedAttackEventIds, setPlayedAttackEventIds] = useState<string[]>([]);
+  const [animationLocked, setAnimationLocked] = useState(false);
+  const [promptNarrationPending, setPromptNarrationPending] = useState(false);
+
+  async function refresh(id = sessionId) {
+    const data = await api<SessionDetail>(`/session/${id}`);
+    setDetail(data);
+    if (data.tab1.active_adventure) {
+      setAdventureDetailsById((current) => ({
+        ...current,
+        [data.tab1.active_adventure!.adventure_id]: data.tab1.active_adventure!,
+      }));
+    }
+    setAdventureId(data.tab1.adventure_id);
+    setSelectedPlayerIds(data.tab1.selected_player_ids);
+    const byPlayer: Record<string, string> = {};
+    data.tab1.party.forEach((member) => {
+      byPlayer[member.player_id] = member.class_id;
+    });
+    setClassByPlayer(byPlayer);
+    const selectableSlots = selectableAgentSlotsForDetail(data);
+    setActiveAgentSlot((current) => (selectableSlots.includes(current) ? current : selectableSlots[0] ?? 1));
+    return data;
+  }
+
+  function mergePromptEvents(current: SessionDetail | null, response: PromptResponse) {
+    if (!current) return current;
+    const mergedEvents = [
+      ...current.events,
+      response.user_event,
+      ...(response.agent_event ? [response.agent_event] : []),
+      ...response.system_events,
+    ];
+    const dedupedEvents = mergedEvents.filter((eventItem, index, all) => (
+      all.findIndex((candidate) => candidate.event_id === eventItem.event_id) === index
+    ));
+    return {
+      ...current,
+      session: response.session,
+      events: dedupedEvents,
+    };
+  }
+
+  async function waitForPromptNarration(promptIndex: number, agentSlot: number, id = sessionId) {
+    const pollToken = narrationPollTokenRef.current + 1;
+    narrationPollTokenRef.current = pollToken;
+    for (let attempt = 0; attempt < 60; attempt += 1) {
+      await new Promise((resolve) => window.setTimeout(resolve, 500));
+      const refreshed = await refresh(id);
+      const foundAgentReply = refreshed.events.some((event) => (
+        event.prompt_index === promptIndex
+        && event.role === "agent"
+        && event.agent_slot === agentSlot
+        && event.kind === "transcript"
+      ));
+      if (narrationPollTokenRef.current !== pollToken) {
+        return;
+      }
+      if (foundAgentReply) {
+        setPromptNarrationPending(false);
+        return;
+      }
+    }
+    if (narrationPollTokenRef.current === pollToken) {
+      setPromptNarrationPending(false);
+      setError("Agent narration is taking longer than expected. Try refreshing the session state.");
+    }
+  }
 
   async function boot() {
     setLoading(true);
     setError("");
     try {
       const [catalogData, created] = await Promise.all([
-        api<Catalog>("/catalog"),
+        api<CatalogBoot>("/catalog/boot"),
         api<{ session_id: string }>("/session", { method: "POST" }),
       ]);
-      setCatalog(catalogData);
+      setCatalogBoot(catalogData);
       setSessionId(created.session_id);
+      setPlayedAttackEventIds([]);
       await refresh(created.session_id);
     } catch (e) {
       setError((e as Error).message);
@@ -267,32 +248,36 @@ export function App() {
     }
   }
 
-  async function refresh(id = sessionId) {
-    const data = await api<SessionDetail>(`/session/${id}`);
-    setDetail(data);
-    setAdventureId(data.tab1.adventure_id);
-    setSelectedPlayerIds(data.tab1.selected_player_ids);
-    const byPlayer: Record<string, string> = {};
-    data.tab1.party.forEach((member) => {
-      byPlayer[member.player_id] = member.class_id;
-    });
-    setClassByPlayer(byPlayer);
-    setSelectedNarrativePlayerId(data.session.selected_narrative_player_id);
-    if (!data.tab1.selected_agent_slots.includes(activeAgentSlot)) {
-      setActiveAgentSlot(data.tab1.selected_agent_slots[0] ?? 1);
-    }
-  }
-
   useEffect(() => {
     void boot();
   }, []);
+
+  useEffect(() => {
+    if (!adventureId || adventureDetailsById[adventureId]) {
+      return;
+    }
+    let cancelled = false;
+    void api<Adventure>(`/catalog/adventures/${adventureId}`)
+      .then((adventure) => {
+        if (cancelled) return;
+        setAdventureDetailsById((current) => ({ ...current, [adventure.adventure_id]: adventure }));
+      })
+      .catch(() => {
+        // Keep the UI usable with summary data if this lazy fetch fails.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [adventureId, adventureDetailsById]);
 
   const transcript = useMemo(() => {
     if (!detail) return [];
     return detail.events
       .filter((event) => event.kind === "transcript")
-      .map((event) => ({ ...event, text: sanitizeVisibleAgentText(event.text) }));
+      .map((event) => ({ ...event, text: sanitizeVisibleAgentText(event.text) }))
+      .filter((event) => event.text.trim());
   }, [detail]);
+
   const latestEligibleReply = useMemo(() => {
     for (let index = transcript.length - 1; index >= 0; index -= 1) {
       const event = transcript[index];
@@ -302,6 +287,7 @@ export function App() {
     }
     return null;
   }, [transcript]);
+
   const playerNameBySlot = useMemo(
     () => new Map((detail?.tab1.party ?? []).map((member) => [member.slot, member.player_name])),
     [detail],
@@ -360,6 +346,21 @@ export function App() {
     return () => window.clearInterval(timer);
   }, [chapterStarting]);
 
+  useEffect(() => {
+    setActiveLocationId("");
+    setLocationView("world");
+    setEncounterLocationTitle("Antlers Rest Inn");
+  }, [detail?.tab1.active_adventure?.adventure_id]);
+
+  useEffect(() => {
+    setEncounterMonsterId((current) => {
+      if (current && detail?.gm_monsters.some((monster) => monster.monster_id === current)) {
+        return current;
+      }
+      return firstMonsterId(detail?.gm_monsters ?? []);
+    });
+  }, [detail?.gm_monsters]);
+
   async function toggleMusicPlayback() {
     const audio = audioRef.current;
     if (!audio) return;
@@ -369,6 +370,7 @@ export function App() {
       return;
     }
     try {
+      audio.volume = MUSIC_VOLUME;
       audio.muted = musicMuted;
       await audio.play();
       setMusicPlaying(true);
@@ -386,11 +388,28 @@ export function App() {
     setMusicMuted(nextMuted);
   }
 
-  const selectedAdventure = useMemo(
-    () => catalog?.adventures.find((item) => item.adventure_id === adventureId) ?? null,
-    [adventureId, catalog],
+  const selectedAdventureSummary = useMemo(
+    () => catalogBoot?.adventures.find((item) => item.adventure_id === adventureId) ?? null,
+    [adventureId, catalogBoot],
   );
+  const selectedAdventure = detail?.tab1.active_adventure ?? (adventureId ? adventureDetailsById[adventureId] ?? null : null);
   const currentTrack = MUSIC_TRACKS[trackIndex] ?? "";
+  const transcriptChars = transcript.reduce((sum, event) => sum + event.text.length + 1, 0);
+  const gmMonsters = detail?.gm_monsters ?? [];
+  const oppositionState = detail?.session.opposition_state ?? null;
+  const oppositionCleanupPending = Boolean(
+    oppositionState?.active
+    && oppositionState.instances.length
+    && oppositionState.instances.every((instance) => instance.is_dead || instance.current_hp <= 0),
+  );
+  const activeOpposition = oppositionState?.active && !oppositionCleanupPending ? oppositionState : null;
+  const adventureLocations = detail?.tab1.active_adventure?.locations ?? [];
+  const activeLocation = adventureLocations.find((location) => location.id === activeLocationId) ?? null;
+  const loadingPulse = [".", "..", "..."][chapterLoadingFrame % 3];
+  const selectedEncounterMonster = gmMonsters.find((monster) => monster.monster_id === encounterMonsterId) ?? gmMonsters[0] ?? null;
+  const encounterMonsterIndex = Math.max(0, gmMonsters.findIndex((monster) => monster.monster_id === encounterMonsterId));
+  const encounterLocationImageUrl = locationImageUrl(encounterLocationTitle);
+  const allPlayersDown = Boolean(detail?.tab1.party.length) && detail!.tab1.party.every((member) => member.hp_current <= 0);
   const startRequirements = [
     adventureId === "" ? "select an adventure" : null,
     selectedPlayerIds.length < 4 ? "select four players" : null,
@@ -400,35 +419,12 @@ export function App() {
     ? `Before you can start the chapter, please ${startRequirements.join(", ")}.`
     : "Ready to begin the adventure.";
 
-  const transcriptChars = transcript.reduce((sum, event) => sum + event.text.length + 1, 0);
-  const latestDraft = detail?.narrative_drafts.length ? detail.narrative_drafts[detail.narrative_drafts.length - 1] : null;
-  const gmMonsters = detail?.gm_monsters ?? [];
-  const activeMonsterCard = gmMonsters[activeMonsterCardIndex] ?? null;
-  const oppositionState = detail?.session.opposition_state ?? null;
-  const activeOpposition = oppositionState?.active ? oppositionState : null;
-  const activeOppositionInstances = activeOpposition?.instances ?? [];
-  const adventureLocations = detail?.tab1.active_adventure?.locations ?? [];
-  const activeLocation =
-    adventureLocations.find((location) => location.id === activeLocationId) ??
-    adventureLocations[0] ??
-    null;
-  const loadingPulse = [".", "..", "..."][chapterLoadingFrame % 3];
-  const activeMonsterCardInstances =
-    activeOpposition && activeMonsterCard?.monster_id === activeOpposition.monster_type ? activeOppositionInstances : [];
-
-  function displayAdventureTitle(adventure: Adventure | null) {
+  function displayAdventureTitle(adventure: AdventureSummary | Adventure | null) {
     if (!adventure) return "";
     return ADVENTURE_TITLE_OVERRIDES[adventure.adventure_id] ?? adventure.title;
   }
 
-  useEffect(() => {
-    setActiveMonsterCardIndex(0);
-  }, [detail?.tab1.adventure_id]);
-
-  useEffect(() => {
-    const firstLocationId = detail?.tab1.active_adventure?.locations?.[0]?.id ?? "";
-    setActiveLocationId(firstLocationId);
-  }, [detail?.tab1.adventure_id]);
+  const headerAdventureTitle = displayAdventureTitle(selectedAdventure ?? selectedAdventureSummary) || "Valaska Adventure Console";
 
   function stopSpeechPlayback() {
     speechAbortRef.current?.abort();
@@ -544,7 +540,7 @@ export function App() {
   function toggleTtsAutoPlay() {
     setTtsAutoPlay((current) => {
       const next = !current;
-      autoPlayBaselineRef.current = next ? latestEligibleReply?.event_id ?? null : latestEligibleReply?.event_id ?? null;
+      autoPlayBaselineRef.current = latestEligibleReply?.event_id ?? null;
       return next;
     });
   }
@@ -574,39 +570,58 @@ export function App() {
     selectedPlayerIds.length === 4 &&
     selectedPlayerIds.every((playerId) => Boolean(classByPlayer[playerId]));
 
-  async function saveTab1() {
-    if (!sessionId) return;
-    setLoading(true);
+  async function saveTab1(showSpinner = true) {
+    if (!sessionId) return null;
+    if (showSpinner) {
+      setLoading(true);
+    }
     setError("");
     try {
-      const class_assignments = Object.fromEntries(
+      const classAssignments = Object.fromEntries(
         selectedPlayerIds.map((playerId, index) => [String(index + 1), classByPlayer[playerId] ?? ""]),
       );
-      await api(`/session/${sessionId}/tab1`, {
+      const tab1Data = await api<SessionDetail["tab1"]>(`/session/${sessionId}/tab1`, {
         method: "PUT",
         body: JSON.stringify({
           preset_id: "valaska",
           adventure_id: adventureId,
           selected_player_ids: selectedPlayerIds,
-          class_assignments,
+          class_assignments: classAssignments,
         }),
       });
-      await refresh();
+      if (tab1Data.active_adventure) {
+        setAdventureDetailsById((current) => ({
+          ...current,
+          [tab1Data.active_adventure!.adventure_id]: tab1Data.active_adventure!,
+        }));
+      }
+      setDetail((current) => (current ? { ...current, tab1: tab1Data } : current));
+      return tab1Data;
     } catch (e) {
       setError((e as Error).message);
+      return null;
     } finally {
-      setLoading(false);
+      if (showSpinner) {
+        setLoading(false);
+      }
     }
   }
 
   async function startChapter() {
+    if (!sessionId) return;
     setChapterStarting(true);
-    await saveTab1();
     setLoading(true);
+    setError("");
     try {
-      await api(`/session/${sessionId}/lock`, { method: "POST" });
-      await refresh();
+      const tab1Data = await saveTab1(false);
+      if (!tab1Data) {
+        return;
+      }
+      const sessionSummary = await api<SessionDetail["session"]>(`/session/${sessionId}/lock`, { method: "POST" });
+      setDetail((current) => (current ? { ...current, session: sessionSummary, tab1: tab1Data } : current));
       setTab(2);
+      setPlayedAttackEventIds([]);
+      void refresh();
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -615,36 +630,32 @@ export function App() {
     }
   }
 
-  function orderedAgentSlots(): number[] {
-    const currentDetail = detail;
-    if (!currentDetail) return [1, 2, 3, 4];
-    if (currentDetail.session.combat_state.in_combat) {
-      return currentDetail.session.combat_state.initiative_order
-        .map((item) => {
-          if (item === "opp:12") return OPPOSITION_SLOT;
-          if (item.startsWith("pc:")) return Number(item.replace("pc:", ""));
-          return Number(item);
-        })
-        .filter((slot) => Number.isFinite(slot));
-    }
-    return currentDetail.tab1.selected_agent_slots;
-  }
-
   async function submitPrompt(event: FormEvent) {
     event.preventDefault();
-    if (!sessionId || !userPrompt.trim()) return;
+    if (!sessionId || !userPrompt.trim() || !detail || promptNarrationPending) return;
+    if (!selectableAgentSlotsForDetail(detail).includes(activeAgentSlot)) return;
     setLoading(true);
     setError("");
     try {
-      await api(`/session/${sessionId}/prompt`, {
+      const response = await api<PromptResponse>(`/session/${sessionId}/prompt`, {
         method: "POST",
         body: JSON.stringify({ agent_slot: activeAgentSlot, user_text: userPrompt }),
       });
+      const nextDetail = mergePromptEvents(detail, response);
+      setDetail(nextDetail);
       setUserPrompt("");
-      await refresh();
-      const order = orderedAgentSlots();
-      const index = order.indexOf(activeAgentSlot);
-      setActiveAgentSlot(order[(index + 1 + order.length) % order.length] ?? order[0] ?? 1);
+      if (nextDetail) {
+        setActiveAgentSlot(nextSelectableSlot(nextDetail, activeAgentSlot));
+      }
+      if (response.narration_pending) {
+        setPromptNarrationPending(true);
+        void waitForPromptNarration(response.user_event.prompt_index, activeAgentSlot, sessionId).catch((pollError: Error) => {
+          setPromptNarrationPending(false);
+          setError(pollError.message);
+        });
+      } else {
+        setPromptNarrationPending(false);
+      }
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -665,40 +676,17 @@ export function App() {
     }
   }
 
-  async function rollInitiative() {
-    setLoading(true);
-    try {
-      await api(`/session/${sessionId}/roll-initiative`, { method: "POST" });
-      await refresh();
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function generateImage() {
-    setImageLoading(true);
-    setError("");
-    try {
-      await api(`/session/${sessionId}/generate-image`, { method: "POST" });
-      await refresh();
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setImageLoading(false);
-    }
-  }
-
   async function takeLongRest() {
     if (!sessionId) return;
     setLongRestLoading(true);
     setError("");
     try {
-      await api(`/session/${sessionId}/long-rest`, { method: "POST" });
+      const refreshed = await api(`/session/${sessionId}/long-rest`, { method: "POST" });
       await refresh();
+      return refreshed;
     } catch (e) {
       setError((e as Error).message);
+      return null;
     } finally {
       setLongRestLoading(false);
     }
@@ -706,6 +694,7 @@ export function App() {
 
   async function travelToSelectedLocation() {
     if (!sessionId || !activeLocation) return;
+    const traveledLocationTitle = activeLocation.title;
     setTravelLoading(true);
     setError("");
     try {
@@ -718,6 +707,9 @@ export function App() {
         }),
       });
       await refresh();
+      setEncounterLocationTitle(traveledLocationTitle);
+      setLocationView("encounter");
+      setActiveLocationId("");
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -725,20 +717,32 @@ export function App() {
     }
   }
 
-  async function spawnOpposition() {
-    if (!sessionId || !activeMonsterCard) return;
+  function cycleEncounterMonster(direction: "previous" | "next") {
+    if (!gmMonsters.length) return;
+    const currentIndex = gmMonsters.findIndex((monster) => monster.monster_id === encounterMonsterId);
+    const safeIndex = currentIndex >= 0 ? currentIndex : 0;
+    const offset = direction === "next" ? 1 : -1;
+    const nextIndex = (safeIndex + offset + gmMonsters.length) % gmMonsters.length;
+    setEncounterMonsterId(gmMonsters[nextIndex].monster_id);
+  }
+
+  async function triggerEncounter() {
+    if (!sessionId || !selectedEncounterMonster) return;
     setSpawnLoading(true);
     setError("");
     try {
       await api(`/session/${sessionId}/spawn-opposition`, {
         method: "POST",
         body: JSON.stringify({
-          monster_type: activeMonsterCard.monster_id,
-          quantity: oppositionQuantity,
+          monster_type: selectedEncounterMonster.monster_id,
+          quantity: encounterQuantity,
         }),
       });
-      await refresh();
-      setActiveAgentSlot(OPPOSITION_SLOT);
+      setPlayedAttackEventIds([]);
+      const refreshed = await refresh();
+      setEncounterModalOpen(false);
+      setLocationView("encounter");
+      setActiveAgentSlot(activeOpposition?.active ? activeAgentSlot : (refreshed.session.opposition_state?.active ? OPPOSITION_SLOT : activeAgentSlot));
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -746,15 +750,16 @@ export function App() {
     }
   }
 
-  async function dismissOpposition() {
+  async function fleeEncounter() {
     if (!sessionId) return;
     setDismissLoading(true);
     setError("");
     try {
       await api(`/session/${sessionId}/dismiss-opposition`, { method: "POST" });
-      await refresh();
+      setPlayedAttackEventIds([]);
+      const refreshed = await refresh();
       if (activeAgentSlot === OPPOSITION_SLOT) {
-        setActiveAgentSlot(1);
+        setActiveAgentSlot(selectableAgentSlotsForDetail(refreshed)[0] ?? 1);
       }
     } catch (e) {
       setError((e as Error).message);
@@ -763,33 +768,21 @@ export function App() {
     }
   }
 
-  async function saveNarrativeLens() {
-    setLoading(true);
+  async function submitFeedback() {
+    if (!sessionId || !feedbackText.trim()) return;
+    setFeedbackSubmitting(true);
+    setError("");
     try {
-      await api(`/session/${sessionId}/narrative-agent`, {
-        method: "PUT",
-        body: JSON.stringify({ selected_player_id: selectedNarrativePlayerId }),
+      const response = await api<FeedbackCreateResponse>(`/session/${sessionId}/feedback`, {
+        method: "POST",
+        body: JSON.stringify({ feedback_text: feedbackText.trim() }),
       });
-      await refresh();
+      setFeedbackSubmittedAt(response.created_at);
+      setFeedbackText("");
     } catch (e) {
       setError((e as Error).message);
     } finally {
-      setLoading(false);
-    }
-  }
-
-  async function buildNarrative() {
-    await saveNarrativeLens();
-    setLoading(true);
-    setNarrativeBuilding(true);
-    try {
-      await api(`/session/${sessionId}/build-narrative`, { method: "POST" });
-      await refresh();
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setNarrativeBuilding(false);
-      setLoading(false);
+      setFeedbackSubmitting(false);
     }
   }
 
@@ -798,6 +791,7 @@ export function App() {
     setLoading(true);
     try {
       await api(`/session/${sessionId}/reset`, { method: "POST" });
+      setPlayedAttackEventIds([]);
       await refresh();
       setTab(1);
     } catch (e) {
@@ -807,21 +801,12 @@ export function App() {
     }
   }
 
-  function downloadChapter() {
-    const chapterText = latestDraft?.chapter_text ?? "";
-    const blob = new Blob([chapterText], { type: "text/plain;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `chapter-${sessionId || "mk3"}.txt`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
+  function startOver() {
+    window.location.reload();
   }
 
-  if (!catalog || !detail) {
-    return <div className="loading-shell">Loading Story Engine MK3...</div>;
+  if (!catalogBoot || !detail) {
+    return <div className="loading-shell">Loading Story Engine MK4...</div>;
   }
 
   return (
@@ -836,16 +821,14 @@ export function App() {
       >
         <source src={currentTrack} type="audio/mpeg" />
       </audio>
-      <header className="hero">
+
+      <header className="hero hero--phase1">
         <div>
-          <div className="eyebrow">Story Engine MK3</div>
-          <h1 className="hero-title">Valaska Adventure Console</h1>
-          <p className="hero-copy">Guided party preparation, GM-first adventure play, and a cleaner wrap-up flow for first-time users.</p>
+          <div className="eyebrow">Story Engine MK4</div>
+          <h1 className="hero-title">{headerAdventureTitle}</h1>
+          <p className="hero-copy">Preparation, adventure play, and feedback now follow a simpler phase-by-phase layout built around the mission map, location cell, and GM prompting.</p>
         </div>
-        <div className="status-strip">
-          <div className="status-card"><span>Session</span><strong>{sessionId}</strong></div>
-          <div className="status-card"><span>State</span><strong>{detail.session.state}</strong></div>
-          <div className="status-card"><span>Round</span><strong>{detail.session.combat_state.in_combat ? detail.session.combat_state.round : "-"}</strong></div>
+        <div className="status-strip status-strip--compact">
           <div className="status-card">
             <span>Music</span>
             <strong>{musicPlaying ? "Playing" : "Paused"}</strong>
@@ -864,363 +847,109 @@ export function App() {
       <nav className="tabs">
         <button className={tab === 1 ? "tab active" : "tab"} onClick={() => setTab(1)}>Preparation</button>
         <button className={tab === 2 ? "tab active" : "tab"} onClick={() => setTab(2)} disabled={!detail.session.tab1_locked}>Adventure</button>
-        <button className={tab === 3 ? "tab active" : "tab"} onClick={() => setTab(3)} disabled={!detail.session.tab1_locked}>Wrap Up</button>
+        <button className={tab === 3 ? "tab active" : "tab"} onClick={() => setTab(3)} disabled={!detail.session.tab1_locked}>Feedback</button>
       </nav>
 
       {error && <div className="error-banner">{error}</div>}
 
       {tab === 1 && (
-        <section className="panel">
-          <div className="panel-grid panel-grid--tab1">
-            <article className="card map-card">
-              <div className="card-head"><span>Start Here</span><h2>Setting Map</h2></div>
-              <img
-                className="media"
-                src={resolveApiUrl(adventurePickerOpen ? catalog.adventure_selection_image_url : catalog.map_image_url)}
-                alt="Valaska"
-              />
-              <p className="card-copy">The setting is fixed to Valaska. Moosehearth is the starting town for every session.</p>
-            </article>
-
-            <article className="card" onMouseEnter={() => setAdventurePickerOpen(true)} onMouseLeave={() => setAdventurePickerOpen(false)}>
-              <div className="card-head"><span>Choose A Mission</span><h2>Adventure Selection</h2></div>
-              <div className="adventure-list">
-                {catalog.adventures.map((adventure) => (
-                  <button
-                    key={adventure.adventure_id}
-                    className={adventureId === adventure.adventure_id ? "adventure-card selected" : "adventure-card"}
-                    onClick={() => setAdventureId(adventure.adventure_id)}
-                  >
-                    <strong>{displayAdventureTitle(adventure)}</strong>
-                    <p>{adventure.description}</p>
-                  </button>
-                ))}
-              </div>
-            </article>
-
-            <article className="card">
-              <div className="card-head"><span>Build The Party</span><h2>Player Selection</h2></div>
-              <div className="player-grid">
-                {catalog.players.map((player) => {
-                  const selected = selectedPlayerIds.includes(player.player_id);
-                  return (
-                    <button key={player.player_id} className={selected ? "player-tile selected" : "player-tile"} onClick={() => togglePlayer(player.player_id)}>
-                      <img src={resolveApiUrl(player.image_url)} alt={player.name} />
-                      <strong>{player.name}</strong>
-                      <span>{player.keywords.join(" • ")}</span>
-                    </button>
-                  );
-                })}
-              </div>
-            </article>
-
-            <article className="card">
-              <div className="card-head"><span>Finalize Loadouts</span><h2>Player Class Selection</h2></div>
-              <div className="class-grid">
-                {selectedPlayerIds.map((playerId, index) => {
-                  const player = catalog.players.find((entry) => entry.player_id === playerId)!;
-                  const selectedClassId = classByPlayer[playerId] ?? "";
-                  const portrait = detail.tab1.party.find((member) => member.player_id === playerId)?.portrait_url ?? player.image_url;
-                  return (
-                    <div key={playerId} className={selectedClassId ? "class-card selected" : "class-card"}>
-                      <img src={resolveApiUrl(selectedClassId ? portrait : player.image_url)} alt={player.name} />
-                      <div>
-                        <strong>{index + 1}. {player.name}</strong>
-                        <p>{player.archetype} • {player.race}</p>
-                      </div>
-                      <select value={selectedClassId} onChange={(e) => setPlayerClass(playerId, e.target.value)}>
-                        <option value="">Choose class</option>
-                        {catalog.classes.map((classItem) => <option key={classItem.class_id} value={classItem.class_id}>{classItem.name}</option>)}
-                      </select>
-                    </div>
-                  );
-                })}
-              </div>
-            </article>
-          </div>
-
-          {selectedAdventure && (
-            <div className="summary-bar">
-              <strong>{displayAdventureTitle(selectedAdventure)}</strong>
-              <span>{selectedAdventure.objectives.map((objective) => objective.description).join(" | ")}</span>
-            </div>
-          )}
-
-          <div className="action-row">
-            <button className="btn" onClick={() => void saveTab1()} disabled={loading}>Save Page</button>
-            {!detail.session.tab1_locked && (
-              <span className="button-tooltip-wrap" title={loading || startReady ? "" : startChapterHint}>
-                <button className="btn accent" onClick={() => void startChapter()} disabled={loading || !startReady}>Start Chapter</button>
-              </span>
-            )}
-            {detail.session.tab1_locked && <button className="btn danger" onClick={() => void resetChapter()} disabled={loading}>Reset Chapter</button>}
-          </div>
-          {chapterStarting && <p className="chapter-loading-notice">Adventure Loading{loadingPulse}</p>}
-          {!detail.session.tab1_locked && !startReady && <p className="inline-guidance">{startChapterHint}</p>}
-        </section>
+        <PreparationTab
+          catalogBoot={catalogBoot}
+          detail={detail}
+          adventureId={adventureId}
+          setAdventureId={setAdventureId}
+          selectedPlayerIds={selectedPlayerIds}
+          classByPlayer={classByPlayer}
+          selectedAdventureSummary={selectedAdventureSummary}
+          selectedAdventure={selectedAdventure}
+          loading={loading}
+          chapterStarting={chapterStarting}
+          startReady={startReady}
+          startChapterHint={startChapterHint}
+          loadingPulse={loadingPulse}
+          onTogglePlayer={togglePlayer}
+          onSetPlayerClass={setPlayerClass}
+          onSaveTab1={() => void saveTab1()}
+          onStartChapter={() => void startChapter()}
+          onResetChapter={() => void resetChapter()}
+          displayAdventureTitle={displayAdventureTitle}
+        />
       )}
 
       {tab === 2 && (
-        <section className="panel">
-          <div className="panel-grid panel-grid--top">
-            <article className="card transcript-card">
-              <div className="card-head">
-                <span>Live Session</span>
-                <h2>Adventure Log</h2>
-                <small>{transcriptChars} chars</small>
-                <div className="card-head-actions">
-                  <span className={`tts-status tts-status--${ttsState}`}>AI Voice: {TTS_STATUS_LABELS[ttsState]}</span>
-                  <button className="btn btn-small" type="button" onClick={() => void playReply()} disabled={!latestEligibleReply || ttsState === "loading"}>
-                    Play
-                  </button>
-                  <button
-                    className={ttsAutoPlay ? "btn btn-small accent-toggle active" : "btn btn-small accent-toggle"}
-                    type="button"
-                    onClick={toggleTtsAutoPlay}
-                  >
-                    Auto Play: {ttsAutoPlay ? "On" : "Off"}
-                  </button>
-                </div>
-              </div>
-              <div ref={transcriptRef} className="transcript-box transcript-box--tall">
-                {transcript.map((event) => (
-                  <div
-                    key={event.event_id}
-                    className="transcript-line"
-                    style={{ color: event.role === "agent" && event.agent_slot ? SLOT_COLORS[event.agent_slot] : "var(--text-primary)" }}
-                  >
-                    {event.text}
-                  </div>
-                ))}
-              </div>
-              {ttsError && <p className="inline-guidance">Voice playback error: {ttsError}</p>}
-            </article>
-
-            <article className="card image-card">
-              <div className="card-head"><span>Current Scene</span><h2>Scene Frame</h2></div>
-              {imageLoading ? (
-                <div className="media media-loading">Loading...</div>
-              ) : (
-                <img className="media" src={resolveApiUrl(detail.image_state.image_url || catalog.default_image_url)} alt="Current scene" />
-              )}
-              <p className="card-copy">
-                {imageLoading ? "Generating a fresh scene image..." : detail.image_state.prompt_text || "Default scene image loaded."}
-              </p>
-            </article>
-          </div>
-
-          <article className="card prompt-shell" style={{ borderColor: SLOT_COLORS[activeAgentSlot] ?? "var(--border-strong)" }}>
-            <div className="card-head"><span>Guide The Party</span><h2>Game Master Prompting</h2></div>
-            <div className="agent-tabs">
-              {detail.tab1.party.map((member) => (
-                <button
-                  key={member.slot}
-                  className={activeAgentSlot === member.slot ? "agent-chip active" : "agent-chip"}
-                  style={{ background: activeAgentSlot === member.slot ? SLOT_COLORS[member.slot] : "transparent", borderColor: SLOT_COLORS[member.slot] }}
-                  onClick={() => setActiveAgentSlot(member.slot)}
-                >
-                  {member.player_name} {member.initiative ? `(${member.initiative})` : ""}
-                </button>
-              ))}
-              {activeOpposition && (
-                <button
-                  key={OPPOSITION_SLOT}
-                  className={activeAgentSlot === OPPOSITION_SLOT ? "agent-chip active" : "agent-chip"}
-                  style={{ background: activeAgentSlot === OPPOSITION_SLOT ? SLOT_COLORS[OPPOSITION_SLOT] : "transparent", borderColor: SLOT_COLORS[OPPOSITION_SLOT] }}
-                  onClick={() => setActiveAgentSlot(OPPOSITION_SLOT)}
-                >
-                  Opposition {detail.session.combat_state.initiative_values["opp:12"] ? `(${detail.session.combat_state.initiative_values["opp:12"]})` : ""}
-                </button>
-              )}
-            </div>
-            <form onSubmit={submitPrompt} className="prompt-form">
-              <textarea value={userPrompt} onChange={(e) => setUserPrompt(e.target.value)} placeholder="GM prompt..." disabled={detail.session.state !== "ACTIVE"} />
-              <div className="action-row">
-                <button className="btn" type="submit" disabled={loading || detail.session.state !== "ACTIVE"}>Send Prompt</button>
-                <button className="btn accent" type="button" onClick={() => void rollInitiative()} disabled={loading}>Roll for Initiative</button>
-                <button
-                  className="btn accent"
-                  type="button"
-                  onClick={() => void takeLongRest()}
-                  disabled={longRestLoading || Boolean(activeOpposition) || detail.session.state !== "ACTIVE"}
-                  title={activeOpposition ? "You cannot take a long rest while monsters are nearby." : ""}
-                >
-                  {longRestLoading ? "Resting..." : "Long Rest"}
-                </button>
-                <button className="btn accent" type="button" onClick={() => void generateImage()} disabled={imageLoading}>Generate Image</button>
-              </div>
-            </form>
-          </article>
-
-          <article className="card card-full-width">
-              <div className="card-head"><span>Party Overview</span><h2>Player Status</h2></div>
-              <div className="status-grid status-grid--row">
-                {detail.tab1.party.map((member) => (
-                  <div key={member.slot} className="status-card-lg">
-                    <img src={resolveApiUrl(member.portrait_url)} alt={member.player_name} />
-                    <strong>{member.player_name} the {member.class_id}</strong>
-                    <span>AC {member.armor_class} | HP {member.hp_current}/{member.hp_max}</span>
-                    <span>{member.status_effects.length ? member.status_effects.join(", ") : "No active status effects"}</span>
-                    <p>{member.inventory.join(" • ")}</p>
-                  </div>
-                ))}
-              </div>
-              <div className="action-row split-row">
-                <button className="btn danger end-button" onClick={() => void endChapter()} disabled={loading || detail.session.state !== "ACTIVE"}>End Chapter</button>
-              </div>
-          </article>
-
-          <article className="card card-full-width">
-              <div className="card-head"><span>Run The Encounter</span><h2>Game Master Screen</h2></div>
-              <div className="objective-strip">
-                <strong>Adventure Completion Objectives</strong>
-                <ul className="objective-list">
-                  {(detail.tab1.active_adventure?.objectives ?? []).map((objective) => (
-                    <li key={objective.id}>{objective.description}</li>
-                  ))}
-                </ul>
-              </div>
-              <div className="gm-screen-layout">
-                <div className="gm-map-panel">
-                  <div className="gm-screen-label">Adventure Map</div>
-                  {detail.tab1.active_adventure ? (
-                    <>
-                      <div className="gm-map-frame">
-                        <img
-                          className="gm-map-image"
-                          src={resolveApiUrl(detail.tab1.active_adventure.map_image_url)}
-                          alt={`${displayAdventureTitle(detail.tab1.active_adventure)} map`}
-                        />
-                        {adventureLocations.map((location) => (
-                          <button
-                            key={location.id}
-                            type="button"
-                            className={activeLocation?.id === location.id ? "gm-map-hotspot active" : "gm-map-hotspot"}
-                            style={{ left: `${location.x_pct}%`, top: `${location.y_pct}%` }}
-                            onClick={() => setActiveLocationId(location.id)}
-                            aria-label={`Location ${location.number}: ${location.title}`}
-                          >
-                            {location.number}
-                          </button>
-                        ))}
-                      </div>
-                      <div className="gm-location-panel">
-                        {activeLocation ? (
-                          <>
-                            <div className="gm-location-header">
-                              <div className="gm-location-heading">
-                                <span>Location {activeLocation.number}</span>
-                                <strong>{activeLocation.title}</strong>
-                              </div>
-                              <button className="btn accent" type="button" onClick={() => void travelToSelectedLocation()} disabled={travelLoading}>
-                                {travelLoading ? "Traveling..." : "Travel"}
-                              </button>
-                            </div>
-                            <p>{activeLocation.description}</p>
-                          </>
-                        ) : (
-                          <p>Select a keyed location on the map.</p>
-                        )}
-                      </div>
-                    </>
-                  ) : (
-                    <div className="gm-map-empty">Select an adventure to load its map.</div>
-                  )}
-                </div>
-                <div className="gm-monster-panel">
-                  <div className="gm-screen-label">Monster Deck</div>
-                  {activeMonsterCard ? (
-                    <div className="gm-monster-card-viewer">
-                      <div className="gm-opposition-controls">
-                        <div className="gm-opposition-spawn">
-                          <label>
-                            Spawn Opposition
-                            <select value={oppositionQuantity} onChange={(e) => setOppositionQuantity(Number(e.target.value))}>
-                              {[1, 2, 3, 4].map((count) => (
-                                <option key={count} value={count}>{count}</option>
-                              ))}
-                            </select>
-                          </label>
-                          <button className="btn accent" type="button" onClick={() => void spawnOpposition()} disabled={spawnLoading || Boolean(activeOpposition)}>
-                            {spawnLoading ? "Spawning..." : activeOpposition ? "Opposition Active" : `Spawn ${activeMonsterCard.monster_id}`}
-                          </button>
-                        </div>
-                        {activeOpposition && (
-                          <button className="btn danger" type="button" onClick={() => void dismissOpposition()} disabled={dismissLoading}>
-                            {dismissLoading ? "Dismissing..." : "Dismiss Opposition"}
-                          </button>
-                        )}
-                      </div>
-                      <div className="gm-monster-card">
-                        <strong>{activeMonsterCard.monster_id}</strong>
-                        <img src={resolveApiUrl(activeMonsterCard.image_url)} alt={activeMonsterCard.monster_id} />
-                        {activeMonsterCardInstances.length > 0 && (
-                          <div className="gm-monster-instance-list">
-                            {activeMonsterCardInstances.map((instance) => (
-                              <div key={instance.monster_id} className={instance.is_dead ? "gm-monster-instance dead" : "gm-monster-instance"}>
-                                {instance.display_name} — {instance.current_hp}/{instance.hp_max} {instance.is_dead ? "DEAD" : ""}
-                              </div>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                      <div className="gm-monster-card-controls">
-                        <button
-                          className="btn"
-                          type="button"
-                          onClick={() => setActiveMonsterCardIndex((current) => (current - 1 + gmMonsters.length) % gmMonsters.length)}
-                          disabled={gmMonsters.length <= 1}
-                        >
-                          Previous
-                        </button>
-                        <span>{activeMonsterCardIndex + 1} / {gmMonsters.length}</span>
-                        <button
-                          className="btn"
-                          type="button"
-                          onClick={() => setActiveMonsterCardIndex((current) => (current + 1) % gmMonsters.length)}
-                          disabled={gmMonsters.length <= 1}
-                        >
-                          Next
-                        </button>
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="gm-map-empty">No monsters are assigned to this adventure yet.</div>
-                  )}
-                </div>
-              </div>
-          </article>
-        </section>
+        <AdventureTab
+          detail={detail}
+          transcript={transcript}
+          transcriptChars={transcriptChars}
+          transcriptRef={transcriptRef}
+          latestEligibleReply={latestEligibleReply}
+          ttsState={ttsState}
+          ttsAutoPlay={ttsAutoPlay}
+          ttsStatusLabels={TTS_STATUS_LABELS}
+          ttsError={ttsError}
+          userPrompt={userPrompt}
+          activeAgentSlot={activeAgentSlot}
+          activeOpposition={activeOpposition}
+          locationOppositionState={oppositionState}
+          activeLocation={activeLocation}
+          adventureLocations={adventureLocations}
+          gmMonsters={gmMonsters}
+          encounterModalOpen={encounterModalOpen}
+          encounterMonsterId={encounterMonsterId}
+          encounterMonsterIndex={encounterMonsterIndex}
+          encounterQuantity={encounterQuantity}
+          selectedEncounterMonster={selectedEncounterMonster}
+          loading={loading || spawnLoading || dismissLoading || promptNarrationPending}
+          longRestLoading={longRestLoading}
+          travelLoading={travelLoading}
+          allPlayersDown={allPlayersDown}
+          worldMapImageUrl={catalogBoot.map_image_url}
+          encounterImageUrl={encounterLocationImageUrl}
+          encounterLocationTitle={encounterLocationTitle}
+          locationView={locationView}
+          playedAttackEventIds={playedAttackEventIds}
+          animationLocked={animationLocked}
+          onPlayReply={() => void playReply()}
+          onAnimationStateChange={setAnimationLocked}
+          onAnimationSettled={refresh}
+          onMarkAttackAnimationPlayed={(eventId) => {
+            setPlayedAttackEventIds((current) => (
+              current.includes(eventId) ? current : [...current.slice(-23), eventId]
+            ));
+          }}
+          onToggleTtsAutoPlay={toggleTtsAutoPlay}
+          onSubmitPrompt={submitPrompt}
+          onSetUserPrompt={setUserPrompt}
+          onSetActiveAgentSlot={setActiveAgentSlot}
+          onTakeLongRest={() => void takeLongRest()}
+          onEndChapter={() => void endChapter()}
+          onSetLocationView={setLocationView}
+          onSetActiveLocationId={setActiveLocationId}
+          onTravelToSelectedLocation={() => void travelToSelectedLocation()}
+          onOpenEncounterModal={() => setEncounterModalOpen(true)}
+          onCloseEncounterModal={() => setEncounterModalOpen(false)}
+          onSetEncounterMonsterId={setEncounterMonsterId}
+          onCycleEncounterMonster={cycleEncounterMonster}
+          onSetEncounterQuantity={setEncounterQuantity}
+          onTriggerEncounter={() => void triggerEncounter()}
+          onFleeEncounter={() => void fleeEncounter()}
+          onStartOver={startOver}
+          displayAdventureTitle={displayAdventureTitle}
+        />
       )}
 
       {tab === 3 && (
-        <section className="panel">
-          <article className="card">
-            <div className="card-head"><span>Choose The Voice</span><h2>Choose a Player to Summarize Your Adventure!</h2></div>
-            <div className="lens-grid lens-grid--row">
-              {detail.tab1.party.map((member) => (
-                <button key={member.player_id} className={selectedNarrativePlayerId === member.player_id ? "lens-card lens-card--compact selected" : "lens-card lens-card--compact"} onClick={() => setSelectedNarrativePlayerId(member.player_id)}>
-                  <img src={resolveApiUrl(member.portrait_url)} alt={member.player_name} />
-                  <strong>{member.player_name}</strong>
-                  <span>{member.archetype}</span>
-                </button>
-              ))}
-            </div>
-            <div className="action-row">
-              <button className="btn accent" onClick={() => void buildNarrative()} disabled={loading || detail.session.state !== "ENDED" || !selectedNarrativePlayerId}>
-                {narrativeBuilding ? "Building..." : "Build Narrative"}
-              </button>
-            </div>
-          </article>
-
-          <article className="card">
-            <div className="card-head"><span>Final Chronicle</span><h2>Player Summary of the Adventure</h2></div>
-            <pre className="memory-box">{latestDraft?.chapter_text ?? ""}</pre>
-            <div className="action-row">
-              <button className="btn" onClick={downloadChapter} disabled={!(latestDraft?.chapter_text ?? "").trim()}>Download Chapter</button>
-            </div>
-          </article>
-        </section>
+        <FeedbackTab
+          detail={detail}
+          feedbackText={feedbackText}
+          feedbackSubmitting={feedbackSubmitting}
+          feedbackSubmittedAt={feedbackSubmittedAt}
+          selectedAdventure={selectedAdventure}
+          selectedAdventureSummary={selectedAdventureSummary}
+          onSetFeedbackText={setFeedbackText}
+          onSubmitFeedback={() => void submitFeedback()}
+          displayAdventureTitle={displayAdventureTitle}
+        />
       )}
     </div>
   );

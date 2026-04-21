@@ -33,6 +33,7 @@ class EventRole(str, enum.Enum):
 class EventKind(str, enum.Enum):
     TRANSCRIPT = "transcript"
     DICE_ROLL = "dice_roll"
+    ATTACK_RESOLVED = "attack_resolved"
     INITIATIVE_SET = "initiative_set"
     TURN_ENDED = "turn_ended"
     DAMAGE_APPLIED = "damage_applied"
@@ -136,3 +137,17 @@ class LLMArtifact(Base):
     raw_input_ref: Mapped[str] = mapped_column(Text, nullable=False)
     raw_output_ref: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class FeedbackSubmission(Base):
+    __tablename__ = "feedback_submissions"
+
+    feedback_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    session_id: Mapped[str] = mapped_column(String(36), ForeignKey("sessions.session_id", ondelete="CASCADE"), nullable=False, index=True)
+    adventure_id: Mapped[str] = mapped_column(String(120), default="", nullable=False)
+    adventure_title: Mapped[str] = mapped_column(String(240), default="", nullable=False)
+    selected_party: Mapped[list] = mapped_column(json_type(), default=list, nullable=False)
+    prompt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    session_duration_seconds: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    feedback_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False, index=True)

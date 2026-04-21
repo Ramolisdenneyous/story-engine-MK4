@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -57,6 +58,20 @@ PROCESS_LEAK_RE = re.compile(
     r"(now,\s+i\s+will\s+update|i\s+will\s+update\s+\w+['’]s?\s+combat\s+state|update\s+\w+['’]s?\s+combat\s+state)",
     re.IGNORECASE,
 )
+ATTACK_RESOLUTION_MARKER_PREFIX = "ATTACK_RESOLUTION:"
+
+
+@dataclass
+class GenerationResult:
+    content: str
+    pending_state_changes: list[dict[str, Any]]
+    pending_roll_results: list[dict[str, Any]]
+    pending_action_results: list[dict[str, Any]]
+    continuation: dict[str, Any] | None = None
+
+    @property
+    def narration_pending(self) -> bool:
+        return self.continuation is not None
 
 
 def _has_effective_state_change(pending_state_changes: list[dict[str, Any]]) -> bool:
@@ -107,6 +122,17 @@ class LLMProvider:
     def generate(self, agent_id: str, model: str, payload: dict) -> str:
         raise NotImplementedError
 
+    def generate_action_response(self, agent_id: str, model: str, payload: dict) -> GenerationResult:
+        return GenerationResult(
+            content=self.generate(agent_id, model, payload),
+            pending_state_changes=[],
+            pending_roll_results=[],
+            pending_action_results=[],
+        )
+
+    def continue_generation(self, continuation: dict[str, Any]) -> str:
+        return str(continuation.get("content", "") or "")
+
     def generate_image(self, prompt_text: str, reference_image_bytes: bytes | None = None) -> str:
         raise NotImplementedError
 
@@ -140,11 +166,25 @@ class MockLLMProvider(LLMProvider):
         user_prompt = payload.get("user_prompt", "")
         return f"I answer as slot {slot}: {user_prompt[:180]}"
 
+    def generate_action_response(self, agent_id: str, model: str, payload: dict) -> GenerationResult:
+        return GenerationResult(
+            content=self.generate(agent_id, model, payload),
+            pending_state_changes=[],
+            pending_roll_results=[],
+            pending_action_results=[],
+        )
+
     def generate_image(self, prompt_text: str, reference_image_bytes: bytes | None = None) -> str:
         return "mock://generated-image"
 
     def generate_speech(self, text: str, voice_alias: str) -> bytes:
         raise RuntimeError("TTS is unavailable when using the mock provider")
+
+    def continue_generation(self, continuation: dict[str, Any]) -> str:
+        messages = continuation.get("messages", [])
+        if messages:
+            return "The action resolves as described."
+        return ""
 
 
 class OpenAIProvider(LLMProvider):
@@ -155,6 +195,12 @@ class OpenAIProvider(LLMProvider):
         self.base_url = base_url.rstrip("/")
 
     def generate(self, agent_id: str, model: str, payload: dict) -> str:
+        system_prompt = self._system_prompt(agent_id, payload)
+        messages = self._messages(agent_id, payload)
+        tools = self._tools(agent_id)
+        return self._chat(model, messages, system_prompt, tools, payload).content
+
+    def generate_action_response(self, agent_id: str, model: str, payload: dict) -> GenerationResult:
         system_prompt = self._system_prompt(agent_id, payload)
         messages = self._messages(agent_id, payload)
         tools = self._tools(agent_id)
@@ -232,11 +278,12 @@ class OpenAIProvider(LLMProvider):
         system_prompt: str,
         tools: list[dict[str, Any]] | None,
         payload_context: dict[str, Any],
-    ) -> str:
+    ) -> GenerationResult:
         chat_messages = [{"role": "system", "content": system_prompt}, *messages]
         force_finalize = False
         pending_state_changes: list[dict[str, Any]] = []
         pending_roll_results: list[dict[str, Any]] = []
+        pending_action_results: list[dict[str, Any]] = []
         used_action_tool = False
         used_inventory_tool = False
         with httpx.Client(timeout=90.0) as client:
@@ -267,13 +314,18 @@ class OpenAIProvider(LLMProvider):
                 tool_calls = message.get("tool_calls") or []
                 if tool_calls:
                     chat_messages.append(message)
+                    retry_required = False
                     for call in tool_calls:
                         args = json.loads(call["function"]["arguments"])
                         if call["function"]["name"] == "resolve_action":
                             result = resolve_action_tool(payload_context, args)
                             used_action_tool = True
-                            pending_roll_results.extend(result.get("rolls", []))
-                            pending_state_changes.extend(result.get("state_changes", []))
+                            if result.get("retry_required"):
+                                retry_required = True
+                            else:
+                                pending_action_results.extend(result.get("results", []))
+                                pending_roll_results.extend(result.get("rolls", []))
+                                pending_state_changes.extend(result.get("state_changes", []))
                         elif call["function"]["name"] == "update_inventory":
                             result = update_inventory_tool(args)
                             pending_state_changes.append(result)
@@ -287,19 +339,40 @@ class OpenAIProvider(LLMProvider):
                                 "content": json.dumps(result, ensure_ascii=True),
                             }
                         )
-                    chat_messages.append(
+                    if retry_required:
+                        chat_messages.append(
+                            {
+                                "role": "system",
+                                "content": (
+                                    "Your last resolve_action call used an invalid actor or target reference. "
+                                    "Read the tool error carefully, choose only from the provided viable_targets list, "
+                                    "and call resolve_action again now using the exact target_id values returned by the backend. "
+                                    "Do not narrate yet."
+                                ),
+                            }
+                        )
+                        force_finalize = False
+                        continue
+                    continuation_messages = [
+                        *chat_messages,
                         {
                             "role": "system",
                             "content": "Use the tool result you just received and answer the GM now. Call additional tools only if another separate roll or state update is still required.",
-                        }
+                        },
+                    ]
+                    return GenerationResult(
+                        content="",
+                        pending_state_changes=pending_state_changes,
+                        pending_roll_results=pending_roll_results,
+                        pending_action_results=pending_action_results,
+                        continuation={"model": model, "messages": continuation_messages},
                     )
-                    force_finalize = True
-                    continue
                 content = (message.get("content") or "").strip()
                 if tools and PSEUDO_TOOL_CALL_RE.search(content):
                     logger.warning("Model emitted pseudo tool syntax instead of a real tool call; retrying with correction.")
                     pending_state_changes = []
                     pending_roll_results = []
+                    pending_action_results = []
                     used_action_tool = False
                     used_inventory_tool = False
                     chat_messages.append(message)
@@ -323,6 +396,7 @@ class OpenAIProvider(LLMProvider):
                     logger.warning("Model described combat or healing resolution without using required tools; retrying with correction.")
                     pending_state_changes = []
                     pending_roll_results = []
+                    pending_action_results = []
                     used_action_tool = False
                     used_inventory_tool = False
                     chat_messages.append(message)
@@ -343,46 +417,48 @@ class OpenAIProvider(LLMProvider):
                     )
                     force_finalize = False
                     continue
-                return self._attach_state_markers(content, pending_state_changes, pending_roll_results)
-        return self._attach_state_markers("I report the roll result and wait for the GM to resolve the outcome.", pending_state_changes, pending_roll_results)
+                return GenerationResult(
+                    content=content,
+                    pending_state_changes=pending_state_changes,
+                    pending_roll_results=pending_roll_results,
+                    pending_action_results=pending_action_results,
+                )
+        return GenerationResult(
+            content="I report the roll result and wait for the GM to resolve the outcome.",
+            pending_state_changes=pending_state_changes,
+            pending_roll_results=pending_roll_results,
+            pending_action_results=pending_action_results,
+        )
 
-    def _attach_state_markers(
-        self,
-        content: str,
-        pending_state_changes: list[dict[str, Any]],
-        pending_roll_results: list[dict[str, Any]],
-    ) -> str:
-        markers: list[str] = []
-        for result in pending_roll_results:
-            markers.append(f"TOOL_DICE_ROLL: {json.dumps(result, ensure_ascii=True)}")
-        for payload in pending_state_changes:
-            source = payload.get("source", "tool")
-            for target in payload.get("targets", []):
-                target_type = target.get("target_type", "player")
-                target_slot = target.get("target_slot")
-                target_id = target.get("target_id", "")
-                for change in target.get("changes", []):
-                    kind = change.get("kind")
-                    amount = int(change.get("amount", 0) or 0)
-                    value = change.get("value", "")
-                    if kind in {"damage", "healing"} and amount <= 0:
-                        continue
-                    if kind in {"status_add", "status_remove", "inventory_add", "inventory_remove"} and not value:
-                        continue
-                    marker = {
-                        "target_type": target_type,
-                        "target_slot": target_slot,
-                        "target_id": target_id,
-                        "kind": kind,
-                        "amount": amount,
-                        "value": value,
-                        "source": source,
-                    }
-                    markers.append(f"COMBAT_STATE_CHANGE: {json.dumps(marker, ensure_ascii=True)}")
-        if not markers:
-            return content
-        suffix = "\n".join(markers)
-        return f"{content}\n{suffix}".strip()
+    def continue_generation(self, continuation: dict[str, Any]) -> str:
+        model = str(continuation.get("model", "") or "")
+        messages = continuation.get("messages", [])
+        if not model or not isinstance(messages, list) or not messages:
+            return ""
+        with httpx.Client(timeout=90.0) as client:
+            for _ in range(3):
+                response = client.post(
+                    f"{self.base_url}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": model,
+                        "messages": messages,
+                        "temperature": 0.4,
+                    },
+                )
+                if response.status_code == 429 and _ < 2:
+                    time.sleep(1.5 * (_ + 1))
+                    continue
+                response.raise_for_status()
+                data = response.json()
+                message = data["choices"][0]["message"]
+                content = (message.get("content") or "").strip()
+                if content:
+                    return content
+        return ""
 
     def _system_prompt(self, agent_id: str, payload: dict) -> str:
         if agent_id == "agent0":

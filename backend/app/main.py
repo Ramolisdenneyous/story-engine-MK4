@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, Response
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
@@ -9,17 +9,23 @@ from sqlalchemy.orm import Session
 from .db import Base, engine, get_db
 from .game_data import ADVENTURES, ADVENTURE_SELECTION_IMAGE_FILE, CLASSES, DEFAULT_IMAGE_FILE, MAP_IMAGE_FILE, MONSTERS, PLAYERS, VALASKA_PRESET_ID
 from .schemas import (
+    AdventureOut,
+    CatalogBootResponse,
     CatalogResponse,
     CombatStateOut,
+    ClassCatalogSummaryOut,
     DiceBatchRequest,
     DiceRollRequest,
     DiceRollResult,
+    FeedbackCreateRequest,
+    FeedbackCreateResponse,
     ImageGenerateResponse,
     InitiativeResponse,
     MonsterReferenceOut,
     NarrativeAgentRequest,
     NarrativeBuildResponse,
     OppositionSpawnRequest,
+    PlayerCatalogDetailOut,
     PromptRequest,
     PromptResponse,
     SessionCreateResponse,
@@ -33,9 +39,11 @@ from .schemas import (
 from .services import (
     asset_url,
     build_narrative,
+    create_feedback_submission,
     create_session,
     dismiss_opposition,
     end_chapter,
+    finalize_prompt_narration,
     generate_scene_image,
     get_session_detail,
     lock_tab1,
@@ -47,7 +55,11 @@ from .services import (
     save_narrative_agent,
     save_tab1,
     serialize_adventure,
+    serialize_adventure_summary,
+    serialize_class_summary,
     serialize_monster_reference,
+    serialize_player_detail,
+    serialize_player_summary,
     spawn_opposition,
     synthesize_player_reply_tts,
     take_long_rest,
@@ -95,6 +107,7 @@ def _ensure_schema() -> None:
             except Exception:
                 pass
         enum_statements = [
+            "ALTER TYPE eventkind ADD VALUE IF NOT EXISTS 'ATTACK_RESOLVED'",
             "ALTER TYPE eventkind ADD VALUE IF NOT EXISTS 'HP_CHANGED'",
             "ALTER TYPE eventkind ADD VALUE IF NOT EXISTS 'OPPOSITION_SPAWNED'",
             "ALTER TYPE eventkind ADD VALUE IF NOT EXISTS 'MONSTER_DIED'",
@@ -183,6 +196,35 @@ def get_catalog():
     )
 
 
+@app.get("/catalog/boot", response_model=CatalogBootResponse)
+def get_catalog_boot():
+    return CatalogBootResponse(
+        preset_id=VALASKA_PRESET_ID,
+        preset_name="Valaska",
+        map_image_url=asset_url(MAP_IMAGE_FILE),
+        adventure_selection_image_url=asset_url(ADVENTURE_SELECTION_IMAGE_FILE),
+        default_image_url=asset_url(DEFAULT_IMAGE_FILE),
+        adventures=[serialize_adventure_summary(adventure_id) for adventure_id in ADVENTURES.keys()],
+        players=[serialize_player_summary(player_id) for player_id in PLAYERS.keys()],
+        classes=[ClassCatalogSummaryOut(**serialize_class_summary(class_id)) for class_id in CLASSES.keys()],
+    )
+
+
+@app.get("/catalog/adventures/{adventure_id}", response_model=AdventureOut)
+def get_adventure_catalog_detail(adventure_id: str):
+    adventure = serialize_adventure(adventure_id)
+    if not adventure:
+        raise HTTPException(status_code=404, detail="Adventure not found")
+    return AdventureOut(**adventure)
+
+
+@app.get("/catalog/players/{player_id}", response_model=PlayerCatalogDetailOut)
+def get_player_catalog_detail(player_id: str):
+    if player_id not in PLAYERS:
+        raise HTTPException(status_code=404, detail="Player not found")
+    return PlayerCatalogDetailOut(**serialize_player_detail(player_id))
+
+
 @app.post("/session", response_model=SessionCreateResponse)
 def create_session_endpoint(db: Session = Depends(get_db)):
     session = create_session(db)
@@ -215,14 +257,31 @@ def lock_session_endpoint(session_id: str, db: Session = Depends(get_db)):
 
 
 @app.post("/session/{session_id}/prompt", response_model=PromptResponse)
-def prompt_endpoint(session_id: str, payload: PromptRequest, db: Session = Depends(get_db)):
+def prompt_endpoint(session_id: str, payload: PromptRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     try:
-        session, user_event, agent_event, summary_triggered = prompt_agent(db, session_id, payload.agent_slot, payload.user_text)
+        session, user_event, agent_event, summary_triggered, system_events, continuation_job = prompt_agent(db, session_id, payload.agent_slot, payload.user_text)
+        if continuation_job:
+            background_tasks.add_task(finalize_prompt_narration, **continuation_job)
         return PromptResponse(
             session=_session_summary(session),
             user_event=user_event,
             agent_event=agent_event,
+            system_events=system_events,
+            narration_pending=bool(continuation_job),
             summary_triggered=summary_triggered,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@app.post("/session/{session_id}/feedback", response_model=FeedbackCreateResponse)
+def create_feedback_endpoint(session_id: str, payload: FeedbackCreateRequest, db: Session = Depends(get_db)):
+    try:
+        feedback = create_feedback_submission(db, session_id, payload.feedback_text)
+        return FeedbackCreateResponse(
+            feedback_id=feedback.feedback_id,
+            session_id=feedback.session_id,
+            created_at=feedback.created_at,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e

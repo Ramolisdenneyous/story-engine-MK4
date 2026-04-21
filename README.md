@@ -1,100 +1,206 @@
-# Story Engine Prototype
+# Story Engine MK4
 
-Story Engine Prototype is a web-based AI storytelling framework where the human user acts as the Game Master and AI-controlled character agents inhabit the party. The system is built around structured turns, aggressive memory summarization, and end-of-chapter narrative generation.
+Story Engine MK4 is the current local-first evolution of the Story Engine project. It builds on the original prototype plus MK2 and MK3, but shifts the architecture toward a tighter Game Master workflow, stronger backend authority, and a much more deliberate tab-based adventure UI.
 
-This repository currently contains a working Phase 1 MVP based on the original product specification in `story-engine-prototype-SPEC (5).txt`.
+The project is still centered on one core idea: the human user is the Game Master, and AI-controlled agents inhabit the party and respond inside a structured game loop. MK4 focuses on making that loop feel clearer, faster, and more dependable in actual play.
 
-## Core Idea
+## What MK4 Is Trying To Do
 
-The project is intentionally not an AI GM.
+MK4 is not an AI GM.
 
 The design goal is:
-- the user directs the scene as GM
-- AI agents respond as defined characters
-- session history is compressed into structured memory
-- the accumulated chapter can be rewritten into a narrative draft
+- the user directs the world as Game Master
+- AI agents respond as party members or as the opposition
+- game state is stored and resolved in the backend, not inferred from narrative prose
+- the frontend presents the active mission, location, party state, combat state, and transcript in a compact play surface
+- the chapter can still be summarized and rewritten into a narrative draft at the end
 
-## Current MVP Scope
+## Current MK4 Focus
 
-The implemented MVP includes:
-- Tab1 chapter setup
-  - world and tone input
-  - chapter/scene input
-  - 1 to 7 configurable agents
-  - per-agent identity text
-- Tab2 GM prompting loop
-  - one user prompt per turn
-  - one selected agent response per prompt
-  - transcript rendering from structured events
-  - automatic summarization at prompt multiples of 7
-  - manual `End Chapter` flow
-- Tab3 output workflow
-  - append-only structured memory view
-  - narrative-agent definition input
-  - chapter draft generation
-  - downloaded `.txt` export of the generated chapter
-- Backend state machine and persistence
-- Docker-based local development environment
-- Minimal unit test coverage for key MVP behaviors
+This repository now reflects the current MK4 direction rather than the earlier prototype MVP.
 
-## Screenshots
+The work in this chat cycle pushed the project toward:
+- backend-authoritative combat resolution
+- two-phase prompt flow for faster combat feel
+- improved local docker hosting for MK4 only
+- a reorganized frontend with split adventure components instead of one oversized `App.tsx`
+- mission preview and location-image support across the UI
+- card-based party and opposition presentation in the Encounter Location view
+- frontend combat overlays and death animation support driven by backend events
+- stronger guardrails around invalid tool calls and stale combat targets
 
-### Tab1 Setup
+## Major Architecture Changes
 
-![Tab1 setup](docs/images/Tab1-setup.png)
+### Backend-Authoritative Resolution
 
-Defines the world, current chapter, and the active character roster for the session.
+One of the biggest architectural changes in MK4 is that combat and healing state are now resolved from backend tool results, not scraped or reconstructed from the model's visible narration.
 
-### Tab2 Play Loop
+The intended order is:
+1. GM sends a prompt
+2. backend calls the LLM
+3. LLM uses tool calls such as `resolve_action`
+4. backend rolls dice, resolves hit or miss, applies HP changes, updates combat state, and emits system events
+5. frontend can begin animation from those backend events
+6. the LLM produces visible narration after tool resolution
 
-![Tab2 play loop](docs/images/Tab2-play-loop.png)
+This keeps the game state authoritative and reduces a whole class of sync bugs that come from trusting prose.
 
-Shows the GM-driven interaction loop, color-coded agent transcript, and active prompt panel.
+### Two-Phase Prompt Flow
 
-### Tab3 Memory and Draft Output
+Prompts now have two possible modes:
 
-![Tab3 memory and draft](docs/images/Tab3-memory-draft.png)
+- simple single-phase mode:
+  - used when no gameplay tool call is needed
+  - the prompt returns normally with no animation trigger
+- two-phase mode:
+  - used when the LLM makes a gameplay tool call
+  - the backend immediately returns updated `system_events`
+  - the frontend starts combat animation right away
+  - the final narration is persisted afterward through a continuation pass
 
-Displays append-only structured memory, narrative-agent controls, and generated chapter output.
+This change was made specifically to reduce the lag between action resolution and visible combat motion in the UI.
 
-## Architecture
+### Safer Tool Retry Behavior
 
-This project follows the monorepo structure defined in the spec:
-- `frontend/` - React + TypeScript UI
-- `backend/` - FastAPI API, state machine, orchestration, persistence
-- `shared/` - shared type definitions
+The backend now does more than simply accept tool arguments at face value.
 
-Technical stack:
-- Frontend: React, TypeScript, Vite
-- Backend: Python, FastAPI, SQLAlchemy
-- Database: Postgres
-- Local runtime: Docker Compose
-- LLM integration: provider abstraction with OpenAI support and mock fallback
+It currently:
+- forces player actions to originate from the actually prompted player
+- canonicalizes fuzzy or slightly malformed target references where possible
+- rejects invalid actor or target references before applying state
+- returns viable live targets to the LLM when a target is invalid
+- allows the model to retry the tool call instead of narrating a broken action
+- rejects an entire invalid batch rather than partially applying half a turn
+
+This is especially important for multi-monster combat and stale target references.
+
+## Current UI Structure
+
+MK4 uses a three-tab flow:
+
+### Tab 1: Preparation
+
+Used to set up the adventure before play begins.
+
+Current preparation flow includes:
+- Valaska preset boot data
+- adventure selection
+- four-player selection
+- class assignment
+- chapter start and tab lock
+
+### Tab 2: Adventure
+
+This is the main play surface.
+
+The current layout is built around:
+- `AdventureLog`
+  - transcript display
+  - TTS playback controls
+- `LocationCell`
+  - world map
+  - adventure map
+  - encounter location image
+  - party card stack
+  - opposition card display
+  - combat overlay animations
+- `GmPromptPanel`
+  - active agent selection
+  - GM prompt input
+  - enter-to-send support
+  - encounter trigger and flee controls
+  - long rest and end chapter controls
+
+### Tab 3: Feedback
+
+The feedback tab is used to collect testing notes and preserve observations from playthroughs. It remains part of the longer-term loop for refining the system.
+
+## Frontend Notes
+
+The frontend has been actively refactored to reduce weight in `App.tsx` and make the interface easier to evolve.
+
+Important recent UI improvements include:
+- dedicated adventure subcomponents split out from `App.tsx`
+- improved loading state when entering the chapter
+- deferred work so Tab 2 appears faster
+- location image support for the encounter location cell
+- preview art support for mission popovers
+- player cards displayed as a visible stack in initiative order
+- opposition cards shown consistently in the location cell
+- automatic shift to Encounter Location after travel and when encounters begin
+- attack, hit, shake, and death overlay animations
+- death fade-out for defeated monsters
+
+The current animation strategy is intentionally more stateless than earlier attempts:
+- the real cards render from live backend state
+- animations use temporary overlay cards
+- after animation completes, the UI refreshes from backend truth
+
+## Combat and State Model
+
+Combat now revolves around event-driven state updates.
+
+Important event categories include:
+- transcript events
+- dice roll events
+- `attack_resolved`
+- HP change events
+- monster death events
+- opposition spawn and dismissal events
+- turn end events
+
+This event trail allows the frontend to:
+- animate attacks from backend-resolved outcomes
+- refresh against the latest session state after animation settles
+- keep the real UI anchored to persisted state instead of transient frontend guesses
+
+## Local Assets
+
+MK4 now includes a larger image set than earlier versions.
+
+Current local assets include:
+- location artwork for encounter locations
+- six adventure preview images
+- player portraits
+- monster images
+- world and adventure maps
+- local music tracks
+
+Many of the location and preview images have been converted to lighter `.webp` assets to keep the UI responsive while still preserving decent display quality.
 
 ## Repository Layout
 
 ```text
-story-engine/
+story-engine-MK4/
   backend/
     app/
     migrations/
     tests/
   docs/
     images/
+    music/
   frontend/
     src/
   shared/
   docker-compose.yml
-  story-engine-prototype-SPEC (5).txt
-  PROJECT_TESTING_LOG.txt
+  MK4_BOOTSTRAP.md
+  README.md
 ```
 
-## Local Setup
+## Technical Stack
+
+- Frontend: React, TypeScript, Vite
+- Backend: Python, FastAPI, SQLAlchemy
+- Database: Postgres
+- Local runtime: Docker Compose
+- LLM integration: provider abstraction with OpenAI support and mock fallback
+
+## Local Docker Setup
 
 ### Prerequisites
 
 - Docker Desktop
-- WSL2 enabled on Windows if using Linux containers
+- Windows with Linux containers enabled
 
 ### Environment
 
@@ -119,79 +225,52 @@ LLM_MODEL_NARRATIVE=gpt-4o
 
 A template is included in `.env.example`.
 
-### Start the Project
+### Start MK4 Locally
 
 From the project root:
 
 ```powershell
-cd "C:\Users\Raymond\Desktop\Test File\hello.js\story-engine"
-& 'C:\Program Files\Docker\Docker\resources\bin\docker.exe' compose up --build -d
+cd "C:\Users\Raymond\Desktop\Test File\hello.js\story-engine-MK4"
+docker compose up --build -d
 ```
 
-### Access the App
+### Local URLs
 
-- Frontend: `http://localhost:5174`
-- Backend health check: `http://localhost:8001/health`
+- Frontend: `http://localhost:5175`
+- Backend: `http://localhost:8002`
+- Backend health check: `http://localhost:8002/health`
+- Postgres: `localhost:5434`
 
-## How to Test the MVP
+## Development Notes
 
-1. Open the frontend.
-2. In Tab1:
-   - define the world and tone
-   - define the chapter scene
-   - choose the number of agents
-   - add agent names and identity text
-3. Lock Tab1 and move to Tab2.
-4. Prompt agents turn by turn.
-5. Verify transcript growth and summarization behavior.
-6. Use `End Chapter`.
-7. In Tab3:
-   - review structured memory
-   - define the narrative agent
-   - build the narrative draft
-   - download the resulting chapter text file
+Some important practical notes for current MK4 work:
 
-## Testing
+- local testing is done through Docker
+- only the active MK4 stack should be hosted locally during work
+- the frontend and backend are being tuned together based on repeated live playtests
+- combat, healing, target resolution, and UI sync are currently higher priority than adding larger feature scope such as RAG
 
-Backend unit tests currently verify:
-- prompt index increment behavior
-- summarization trigger at multiples of 7
-- append-only memory blocks
-- session state transitions
+## Current Testing Priorities
 
-Run tests from `backend/`:
+Recent testing has focused heavily on:
+- single-monster and multi-monster combat
+- initiative and turn rotation
+- healing and knockout recovery
+- monster death and dismissal timing
+- animation timing and responsiveness
+- frontend/backend sync after attack sequences
+- invalid target handling in tool calls
 
-```powershell
-python -m pytest -q
-```
+## Known Constraints
 
-## Notable Work Completed
-
-The current repository includes work completed after the original spec review:
-- full MVP scaffold from spec
-- Docker bring-up and validation
-- frontend runtime fixes
-- OpenAI provider integration via environment variables
-- UI fixes discovered during live testing
-- character prompt plumbing improvements so agents receive:
-  - agent identity
-  - structured memory
-  - recent transcript context
-  - current user prompt
-
-A more detailed implementation and testing trail is recorded in `PROJECT_TESTING_LOG.txt`.
-
-## Current Limitations
-
-This is still a prototype MVP.
+MK4 is still an active development branch of the project.
 
 Known constraints include:
-- quality tuning is still in progress
-- narrative drift and character fidelity need continued iteration
-- no multi-user auth
-- no collaborative editing
-- no advanced exports beyond text download
-- no Phase 2 features from the original roadmap
+- combat behavior still needs more live testing
+- animation polish is still iterative
+- model behavior still needs guardrails for tool accuracy
+- the README reflects the current architecture, but the project is still evolving quickly
+- RAG, vector search, and larger rules-database support are not part of the current MK4 scope
 
 ## License
 
@@ -204,9 +283,3 @@ See:
 Attribution reference:
 
 `story-engine-prototype by Ramolis Systems (https://github.com/Ramolisdenneyous), licensed under CC BY-NC-SA 4.0`
-
-## Specification Reference
-
-The original source specification used for this prototype is included here:
-- `story-engine-prototype-SPEC (5).txt`
-

@@ -67,6 +67,42 @@ class AdventureOut(BaseModel):
     locations: list[AdventureLocationOut]
 
 
+class AdventureSummaryOut(BaseModel):
+    adventure_id: str
+    title: str
+    description: str
+
+
+class PlayerCatalogSummaryOut(BaseModel):
+    player_id: str
+    name: str
+    archetype: str
+    gender: str
+    race: str
+    keywords: list[str]
+    image_url: str
+
+
+class PlayerCatalogDetailOut(BaseModel):
+    player_id: str
+    name: str
+    archetype: str
+    gender: str
+    race: str
+    irl_job: str
+    keywords: list[str]
+    display_text: str
+    image_url: str
+
+
+class ClassCatalogSummaryOut(BaseModel):
+    class_id: str
+    name: str
+    role: str
+    armor_class: int
+    hp_max: int
+
+
 class Tab1InputResponse(BaseModel):
     preset_id: str
     adventure_id: str
@@ -103,6 +139,7 @@ class OppositionStateOut(BaseModel):
     monster_type: str
     monster_stats: dict
     instances: list[OppositionMonsterInstanceOut]
+    cleanup_after: str = ""
 
 
 class SessionSummary(BaseModel):
@@ -119,6 +156,16 @@ class SessionSummary(BaseModel):
 class PromptRequest(BaseModel):
     agent_slot: int
     user_text: str
+
+
+class FeedbackCreateRequest(BaseModel):
+    feedback_text: str = Field(min_length=1, max_length=10000)
+
+
+class FeedbackCreateResponse(BaseModel):
+    feedback_id: str
+    session_id: str
+    created_at: datetime
 
 
 class TravelRequest(BaseModel):
@@ -159,7 +206,9 @@ class MemoryBlockOut(BaseModel):
 class PromptResponse(BaseModel):
     session: SessionSummary
     user_event: EventOut
-    agent_event: EventOut
+    agent_event: EventOut | None = None
+    system_events: list[EventOut] = Field(default_factory=list)
+    narration_pending: bool = False
     summary_triggered: bool
 
 
@@ -223,6 +272,17 @@ class MonsterReferenceOut(BaseModel):
     attack_bonus: int
     attack_text: str
     image_url: str
+
+
+class CatalogBootResponse(BaseModel):
+    preset_id: str
+    preset_name: str
+    map_image_url: str
+    adventure_selection_image_url: str
+    default_image_url: str
+    adventures: list[AdventureSummaryOut]
+    players: list[PlayerCatalogSummaryOut]
+    classes: list[ClassCatalogSummaryOut]
 
 
 class CatalogResponse(BaseModel):

@@ -1,4 +1,5 @@
 import copy
+import difflib
 import json
 import logging
 import re
@@ -14,6 +15,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from .config import settings
+from .db import SessionLocal
 from .game_data import (
     ADVENTURES,
     CLASSES,
@@ -25,18 +27,17 @@ from .game_data import (
     VALASKA_PRESET_ID,
     VALASKA_SYSTEM_PROMPT,
 )
-from .llm import get_provider, log_artifact, tts_voice_alias_for_player
-from .models import Event, EventKind, EventRole, MemoryBlock, MemoryBlockType, NarrativeDraft, Session as SessionModel, SessionState, Tab1Inputs
+from .llm import GenerationResult, get_provider, log_artifact, tts_voice_alias_for_player
+from .models import Event, EventKind, EventRole, FeedbackSubmission, MemoryBlock, MemoryBlockType, NarrativeDraft, Session as SessionModel, SessionState, Tab1Inputs
 
 DICE_RE = re.compile(r"^\s*(\d{1,3})\s*d\s*(4|6|8|10|12|20)\s*([+-]\s*\d+)?\s*$", re.IGNORECASE)
-COMBAT_STATE_MARKER_RE = re.compile(r"^COMBAT_STATE_CHANGE:\s*(\{.+\})$")
-TOOL_DICE_ROLL_MARKER_RE = re.compile(r"^TOOL_DICE_ROLL:\s*(\{.+\})$")
 VALID_DICE_SIDES = {4, 6, 8, 10, 12, 20}
 SLOT_COLORS = {1: "red", 2: "orange", 3: "yellow", 4: "green"}
 ASSET_DIR = Path("/app/docs/images")
 OPPOSITION_AGENT_SLOT = 12
 OPPOSITION_INITIATIVE_ID = "opp:12"
 OPPOSITION_DISPLAY_NAME = "Opposition"
+OPPOSITION_CLEANUP_DELAY_SECONDS = 5
 MONSTER_INSTANCE_LABELS = ["Monster-One", "Monster-Two", "Monster-Three", "Monster-Four"]
 logger = logging.getLogger(__name__)
 OPENING_TRANSCRIPT = (
@@ -81,6 +82,7 @@ def _empty_opposition_state() -> dict:
         "monster_type": "",
         "monster_stats": {},
         "instances": [],
+        "cleanup_after": "",
     }
 
 
@@ -94,6 +96,51 @@ def _monster_template(monster_type: str) -> dict:
 def _living_opposition_instances(opposition_state: dict | None) -> list[dict]:
     state = opposition_state or _empty_opposition_state()
     return [instance for instance in state.get("instances", []) if not instance.get("is_dead")]
+
+
+def _arm_opposition_cleanup(opposition_state: dict) -> dict:
+    state = copy.deepcopy(opposition_state or _empty_opposition_state())
+    if not state.get("cleanup_after"):
+        state["cleanup_after"] = (
+            datetime.now(timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+        )
+    return state
+
+
+def _maybe_finalize_opposition_cleanup(db: Session, session: SessionModel) -> bool:
+    opposition_state = copy.deepcopy(session.opposition_state or _empty_opposition_state())
+    cleanup_after = str(opposition_state.get("cleanup_after", "") or "")
+    if not opposition_state.get("active") or not cleanup_after:
+        return False
+    try:
+        cleanup_started = datetime.fromisoformat(cleanup_after)
+    except ValueError:
+        return False
+    if cleanup_started.tzinfo is None:
+        cleanup_started = cleanup_started.replace(tzinfo=timezone.utc)
+    elapsed = (datetime.now(timezone.utc) - cleanup_started).total_seconds()
+    if elapsed < OPPOSITION_CLEANUP_DELAY_SECONDS:
+        return False
+    _dismiss_opposition_state(db, session, session.prompt_index, reason="all_dead")
+    return True
+
+
+def _ensure_nonblocking_opposition_state(db: Session, session: SessionModel) -> None:
+    opposition_state = copy.deepcopy(session.opposition_state or _empty_opposition_state())
+    if not opposition_state.get("active"):
+        return
+    if _living_opposition_instances(opposition_state):
+        return
+    if _maybe_finalize_opposition_cleanup(db, session):
+        db.flush()
+        return
+    # If the UI has already reached the point where the user is trying to
+    # continue play, do not let a dead-only cleanup hold block long rest or a
+    # new encounter. Finalize immediately and clear combat state.
+    _dismiss_opposition_state(db, session, session.prompt_index, reason="cleanup_forced")
+    db.flush()
 
 
 def _default_generated_image() -> dict:
@@ -120,12 +167,89 @@ def serialize_adventure(adventure_id: str | None) -> dict | None:
     }
 
 
+def serialize_adventure_summary(adventure_id: str) -> dict:
+    adventure = ADVENTURES[adventure_id]
+    return {
+        "adventure_id": adventure["adventure_id"],
+        "title": adventure["title"],
+        "description": adventure["description"],
+    }
+
+
 def serialize_monster_reference(monster_id: str) -> dict:
     monster = MONSTERS[monster_id]
     return {
         **monster,
         "image_url": asset_url(monster["image_file"]),
     }
+
+
+def serialize_player_summary(player_id: str) -> dict:
+    player = PLAYERS[player_id]
+    return {
+        "player_id": player["player_id"],
+        "name": player["name"],
+        "archetype": player["archetype"],
+        "gender": player["gender"],
+        "race": player["race"],
+        "keywords": player["keywords"],
+        "image_url": asset_url(f"Player-{player['player_id']}.jpg"),
+    }
+
+
+def serialize_player_detail(player_id: str) -> dict:
+    player = PLAYERS[player_id]
+    return {
+        **serialize_player_summary(player_id),
+        "irl_job": player["irl_job"],
+        "keywords": player["keywords"],
+        "display_text": player["display_text"],
+    }
+
+
+def serialize_class_summary(class_id: str) -> dict:
+    class_data = CLASSES[class_id]
+    return {
+        "class_id": class_data["class_id"],
+        "name": class_data["name"],
+        "role": class_data["role"],
+        "armor_class": class_data["armor_class"],
+        "hp_max": class_data["hp_max"],
+    }
+
+
+def create_feedback_submission(db: Session, session_id: str, feedback_text: str) -> FeedbackSubmission:
+    session = get_session_or_404(db, session_id)
+    tab1 = get_tab1_or_create(db, session_id)
+    party = derive_party_state(db, session_id)
+    adventure = serialize_adventure(tab1.adventure_id)
+    now = datetime.utcnow()
+    submission = FeedbackSubmission(
+        session_id=session.session_id,
+        adventure_id=tab1.adventure_id or "",
+        adventure_title=adventure["title"] if adventure else "",
+        selected_party=[
+            {
+                "slot": slot,
+                "player_id": player_id,
+                "player_name": PLAYERS[player_id]["name"],
+                "class_id": class_id,
+                "hp_current": int((party.get(str(slot), {}) or {}).get("hp_current", CLASSES[class_id]["hp_max"])),
+                "hp_max": CLASSES[class_id]["hp_max"],
+            }
+            for slot in range(1, 5)
+            for player_id, class_id in [(_player_for_slot(tab1, slot), _class_assignment_for_slot(tab1, slot))]
+            if player_id and class_id
+        ],
+        prompt_count=session.prompt_index,
+        session_duration_seconds=max(0, int((now - session.created_at).total_seconds())),
+        feedback_text=feedback_text.strip(),
+        created_at=now,
+    )
+    db.add(submission)
+    db.commit()
+    db.refresh(submission)
+    return submission
 
 
 def _portrait_filename(player_id: str, class_id: str | None = None) -> str:
@@ -606,6 +730,41 @@ def _build_monster_actor_catalog(session: SessionModel) -> list[dict]:
     return actors
 
 
+def _normalize_action_reference(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
+
+
+def _register_action_reference(alias_map: dict[str, set[str]], canonical_id: str, *values: str) -> None:
+    for value in values:
+        normalized = _normalize_action_reference(value)
+        if not normalized:
+            continue
+        alias_map.setdefault(normalized, set()).add(canonical_id)
+
+
+def _canonicalize_action_reference(
+    value: str,
+    exact_map: dict[str, dict],
+    alias_map: dict[str, set[str]],
+) -> str:
+    raw_value = str(value or "")
+    if not raw_value:
+        return ""
+    if raw_value in exact_map:
+        return raw_value
+
+    normalized = _normalize_action_reference(raw_value)
+    aliases = sorted(alias_map.get(normalized, set()))
+    if len(aliases) == 1:
+        return aliases[0]
+
+    close_matches = difflib.get_close_matches(raw_value, list(exact_map.keys()), n=1, cutoff=0.85)
+    if close_matches:
+        return close_matches[0]
+
+    return raw_value
+
+
 def _resolve_payload_context(payload: dict) -> dict:
     player_identity = payload.get("agent_identity", {})
     class_sheet = payload.get("class_sheet", {})
@@ -613,23 +772,34 @@ def _resolve_payload_context(payload: dict) -> dict:
     mechanical_hint = copy.deepcopy(payload.get("mechanical_resolution_hint", {}))
     actor_map: dict[str, dict] = {}
     target_map: dict[str, dict] = {}
+    actor_alias_map: dict[str, set[str]] = {}
+    target_alias_map: dict[str, set[str]] = {}
     action_map: dict[tuple[str, str], dict] = {}
 
     for target in mechanical_hint.get("ally_targets", []):
-        target_map[target.get("target_id", "")] = target
+        target_id = str(target.get("target_id", "") or "")
+        target_map[target_id] = target
+        _register_action_reference(target_alias_map, target_id, target_id, str(target.get("name", "") or ""))
     for target in mechanical_hint.get("visible_monster_targets", []):
-        target_map[target.get("target_id", "")] = target
+        target_id = str(target.get("target_id", "") or "")
+        target_map[target_id] = target
+        _register_action_reference(target_alias_map, target_id, target_id, str(target.get("name", "") or ""))
     for target in mechanical_hint.get("party_targets", []):
-        actor_id = target.get("target_id", "")
+        actor_id = str(target.get("target_id", "") or "")
         target_map[actor_id] = target
         actor_map[actor_id] = target
+        _register_action_reference(target_alias_map, actor_id, actor_id, str(target.get("name", "") or ""), str(target.get("player_name", "") or ""))
+        _register_action_reference(actor_alias_map, actor_id, actor_id, str(target.get("name", "") or ""), str(target.get("player_name", "") or ""))
     for actor in mechanical_hint.get("living_monster_actors", []):
-        actor_map[actor.get("actor_id", "")] = actor
-        action_map[(actor.get("actor_id", ""), actor.get("ability", ""))] = actor
+        actor_id = str(actor.get("actor_id", "") or "")
+        actor_map[actor_id] = actor
+        action_map[(actor_id, actor.get("ability", ""))] = actor
+        _register_action_reference(actor_alias_map, actor_id, actor_id, str(actor.get("name", "") or ""))
 
     actor_id = mechanical_hint.get("actor_id", "")
     if actor_id:
-        actor_map[actor_id] = {
+        canonical_actor_id = str(actor_id or "")
+        actor_map[canonical_actor_id] = {
             "actor_id": actor_id,
             "slot": player_identity.get("slot"),
             "name": player_identity.get("name", ""),
@@ -637,12 +807,15 @@ def _resolve_payload_context(payload: dict) -> dict:
             "armor_class": class_sheet.get("armor_class"),
             "hp_max": class_sheet.get("hp_max"),
         }
+        _register_action_reference(actor_alias_map, canonical_actor_id, canonical_actor_id, str(player_identity.get("name", "") or ""))
     for action in mechanical_hint.get("available_actions", []):
         action_map[(actor_id, action.get("ability", ""))] = action
 
     return {
         "actor_map": actor_map,
+        "actor_alias_map": actor_alias_map,
         "target_map": target_map,
+        "target_alias_map": target_alias_map,
         "action_map": action_map,
         "mechanical_hint": mechanical_hint,
         "opposition_state": opposition_state,
@@ -650,14 +823,91 @@ def _resolve_payload_context(payload: dict) -> dict:
     }
 
 
+def _list_viable_targets(context: dict) -> list[dict[str, Any]]:
+    targets: list[dict[str, Any]] = []
+    for target_id, target in context["target_map"].items():
+        targets.append(
+            {
+                "target_id": target_id,
+                "name": str(target.get("name", "") or target.get("player_name", "") or target_id),
+                "target_type": str(target.get("target_type", "") or ""),
+                "current_hp": target.get("current_hp"),
+                "hp_max": target.get("hp_max"),
+            }
+        )
+    return sorted(targets, key=lambda item: (str(item["target_type"]), str(item["name"])))
+
+
 def resolve_actions_for_payload(payload: dict, args: dict[str, Any]) -> dict[str, Any]:
     context = _resolve_payload_context(payload)
     actions = args.get("actions", [])
+    normalized_actions: list[dict[str, Any]] = []
+    validation_errors: list[dict[str, Any]] = []
+    viable_targets = _list_viable_targets(context)
+
+    for index, action in enumerate(actions):
+        raw_actor_id = str(action.get("actor_id", "") or "")
+        action_type = str(action.get("action_type", "") or "").upper()
+        ability = _normalize_ability_name(str(action.get("ability", "") or ""))
+        raw_target_id = str(action.get("target_id", "") or "")
+        forced_actor_id = str(context["mechanical_hint"].get("actor_id", "") or "")
+        if forced_actor_id:
+            actor_id = forced_actor_id
+        else:
+            actor_id = _canonicalize_action_reference(raw_actor_id, context["actor_map"], context["actor_alias_map"])
+        target_id = _canonicalize_action_reference(raw_target_id, context["target_map"], context["target_alias_map"])
+        actor = context["actor_map"].get(actor_id, {})
+        target = context["target_map"].get(target_id, {})
+
+        if not actor:
+            validation_errors.append(
+                {
+                    "action_index": index,
+                    "kind": "unknown_actor",
+                    "provided_actor_id": raw_actor_id,
+                    "resolved_actor_id": actor_id,
+                    "reason": f"Unknown actor reference: {raw_actor_id}",
+                }
+            )
+            continue
+
+        if not target:
+            validation_errors.append(
+                {
+                    "action_index": index,
+                    "kind": "unknown_target",
+                    "provided_target_id": raw_target_id,
+                    "resolved_target_id": target_id,
+                    "reason": f"Unknown target reference: {raw_target_id}",
+                    "viable_targets": viable_targets,
+                }
+            )
+            continue
+
+        normalized_actions.append(
+            {
+                "actor_id": actor_id,
+                "action_type": action_type,
+                "ability": ability,
+                "target_id": target_id,
+            }
+        )
+
+    if validation_errors:
+        return {
+            "results": [],
+            "rolls": [],
+            "state_changes": [],
+            "retry_required": True,
+            "errors": validation_errors,
+            "viable_targets": viable_targets,
+        }
+
     results: list[dict[str, Any]] = []
     rolls: list[dict[str, Any]] = []
     state_targets: list[dict[str, Any]] = []
 
-    for action in actions:
+    for action in normalized_actions:
         actor_id = str(action.get("actor_id", "") or "")
         action_type = str(action.get("action_type", "") or "").upper()
         ability = _normalize_ability_name(str(action.get("ability", "") or ""))
@@ -777,6 +1027,9 @@ def resolve_actions_for_payload(payload: dict, args: dict[str, Any]) -> dict[str
         "results": results,
         "rolls": rolls,
         "state_changes": [{"targets": state_targets, "source": "resolve_action"}] if state_targets else [],
+        "retry_required": False,
+        "errors": [],
+        "viable_targets": viable_targets,
     }
 
 
@@ -946,32 +1199,6 @@ def _run_summarization(db: Session, session: SessionModel, to_prompt_index: int)
         return True
 
 
-def _strip_markers(agent_text: str) -> tuple[str, list[dict]]:
-    clean_lines = []
-    markers: list[dict] = []
-    for line in agent_text.splitlines():
-        dice_match = TOOL_DICE_ROLL_MARKER_RE.match(line.strip())
-        if dice_match:
-            try:
-                payload = json.loads(dice_match.group(1))
-                payload["_marker_type"] = "dice_roll"
-                markers.append(payload)
-                continue
-            except Exception:
-                pass
-        combat_match = COMBAT_STATE_MARKER_RE.match(line.strip())
-        if combat_match:
-            try:
-                payload = json.loads(combat_match.group(1))
-                payload["_marker_type"] = "combat_state"
-                markers.append(payload)
-                continue
-            except Exception:
-                pass
-        clean_lines.append(line)
-    return "\n".join(clean_lines).strip(), markers
-
-
 def _append_system_event(db: Session, session_id: str, prompt_index: int, kind: EventKind, text: str, payload: dict) -> None:
     db.add(
         Event(
@@ -986,50 +1213,77 @@ def _append_system_event(db: Session, session_id: str, prompt_index: int, kind: 
     )
 
 
-def _apply_markers(db: Session, session: SessionModel, agent_slot: int, prompt_index: int, markers: list[dict]) -> None:
-    for marker in markers:
-        if marker.get("_marker_type") == "dice_roll":
-            result = {key: value for key, value in marker.items() if key != "_marker_type"}
-            label = str(result.get("label", "") or result.get("formula", "Dice Roll"))
-            total = int(result.get("total", 0) or 0)
-            db.add(
-                Event(
-                    session_id=session.session_id,
-                    prompt_index=prompt_index,
-                    role=EventRole.SYSTEM,
-                    kind=EventKind.DICE_ROLL,
-                    agent_slot=agent_slot,
-                    text=f"{label}: {total}",
-                    json_payload=result,
-                )
+def _apply_generation_result(db: Session, session: SessionModel, agent_slot: int, prompt_index: int, generation: GenerationResult) -> None:
+    for result in generation.pending_roll_results:
+        label = str(result.get("label", "") or result.get("formula", "Dice Roll"))
+        total = int(result.get("total", 0) or 0)
+        db.add(
+            Event(
+                session_id=session.session_id,
+                prompt_index=prompt_index,
+                role=EventRole.SYSTEM,
+                kind=EventKind.DICE_ROLL,
+                agent_slot=agent_slot,
+                text=f"{label}: {total}",
+                json_payload=result,
             )
-            continue
-        target_type = marker.get("target_type", "player")
-        if target_type == "monster":
-            target_id = marker.get("target_id", "")
-            _append_state_change(
-                db,
-                session,
-                prompt_index,
-                target_type="monster",
-                target_id=target_id,
-                kind=marker.get("kind", ""),
-                amount=int(marker.get("amount", 0) or 0),
-                value=str(marker.get("value", "") or ""),
-                source=marker.get("source", "marker"),
-            )
-            continue
-        _append_state_change(
-            db,
-            session,
-            prompt_index,
-            target_type="player",
-            target_slot=int(marker.get("target_slot", agent_slot) or agent_slot),
-            kind=marker.get("kind", ""),
-            amount=int(marker.get("amount", 0) or 0),
-            value=str(marker.get("value", "") or ""),
-            source=marker.get("source", "marker"),
         )
+
+    for result in generation.pending_action_results:
+        action_type = str(result.get("action_type", "")).upper()
+        ability = str(result.get("ability", "")).upper()
+        if action_type != "ATTACK" and not (action_type == "SPELL" and ability == "MAGIC_MISSILE"):
+            continue
+        db.add(
+            Event(
+                session_id=session.session_id,
+                prompt_index=prompt_index,
+                role=EventRole.SYSTEM,
+                kind=EventKind.ATTACK_RESOLVED,
+                agent_slot=agent_slot,
+                text="Attack resolved.",
+                json_payload={
+                    "actor_id": result.get("actor_id", ""),
+                    "target_id": result.get("target_id", ""),
+                    "hit": bool(result.get("hit", False)),
+                    "damage": int(result.get("damage", 0) or 0),
+                    "target_hp_after": int(result.get("target_hp_after", 0) or 0),
+                },
+            )
+        )
+
+    for payload in generation.pending_state_changes:
+        source = payload.get("source", "tool")
+        for target in payload.get("targets", []):
+            target_type = str(target.get("target_type", "player") or "player")
+            for change in target.get("changes", []):
+                kind = str(change.get("kind", "") or "")
+                amount = int(change.get("amount", 0) or 0)
+                value = str(change.get("value", "") or "")
+                if target_type == "monster":
+                    _append_state_change(
+                        db,
+                        session,
+                        prompt_index,
+                        target_type="monster",
+                        target_id=str(target.get("target_id", "") or ""),
+                        kind=kind,
+                        amount=amount,
+                        value=value,
+                        source=source,
+                    )
+                else:
+                    _append_state_change(
+                        db,
+                        session,
+                        prompt_index,
+                        target_type="player",
+                        target_slot=int(target.get("target_slot", agent_slot) or agent_slot),
+                        kind=kind,
+                        amount=amount,
+                        value=value,
+                        source=source,
+                    )
 
 
 def _append_state_change(
@@ -1150,7 +1404,7 @@ def _append_state_change(
             ],
         )
         if opposition_state.get("active") and not living_instances:
-            _dismiss_opposition_state(db, session, prompt_index, reason="all_dead")
+            session.opposition_state = _arm_opposition_cleanup(opposition_state)
         return
 
     slot = int(target_slot)
@@ -1199,19 +1453,10 @@ def _dismiss_opposition_state(db: Session, session: SessionModel, prompt_index: 
             for item in opposition_state.get("instances", [])
         ],
     )
-    opposition_state["active"] = False
-    session.opposition_state = opposition_state
+    session.opposition_state = _empty_opposition_state()
     session.selected_agent_slots = [slot for slot in session.selected_agent_slots if slot != OPPOSITION_AGENT_SLOT]
     session.agent_names.pop(str(OPPOSITION_AGENT_SLOT), None)
-    combat = copy.deepcopy(session.combat_state or _empty_combat_state())
-    combat["initiative_order"] = [combatant for combatant in combat.get("initiative_order", []) if combatant != OPPOSITION_INITIATIVE_ID]
-    combat["initiative_values"].pop(OPPOSITION_INITIATIVE_ID, None)
-    if combat.get("initiative_order"):
-        combat["turn_index"] = min(int(combat.get("turn_index", 0)), len(combat["initiative_order"]) - 1)
-        combat["in_combat"] = True
-    else:
-        combat = _empty_combat_state()
-    session.combat_state = combat
+    session.combat_state = _empty_combat_state()
     _append_system_event(
         db,
         session.session_id,
@@ -1281,7 +1526,99 @@ def _advance_turn_if_in_combat(session: SessionModel) -> None:
     session.combat_state = combat
 
 
-def prompt_agent(db: Session, session_id: str, agent_slot: int, user_text: str) -> tuple[SessionModel, Event, Event, bool]:
+def _prompt_system_events(db: Session, session_id: str, prompt_index: int) -> list[Event]:
+    return db.execute(
+        select(Event)
+        .where(Event.session_id == session_id, Event.prompt_index == prompt_index, Event.role == EventRole.SYSTEM)
+        .order_by(Event.created_at.asc())
+    ).scalars().all()
+
+
+def _create_agent_transcript_event(
+    db: Session,
+    session_id: str,
+    prompt_index: int,
+    agent_slot: int,
+    text: str,
+) -> Event:
+    agent_event = Event(
+        session_id=session_id,
+        prompt_index=prompt_index,
+        role=EventRole.AGENT,
+        kind=EventKind.TRANSCRIPT,
+        agent_slot=agent_slot,
+        text=text,
+        json_payload={},
+    )
+    db.add(agent_event)
+    db.flush()
+    return agent_event
+
+
+def finalize_prompt_narration(
+    session_id: str,
+    prompt_index: int,
+    agent_slot: int,
+    agent_id: str,
+    model: str,
+    agent_payload: dict[str, Any],
+    continuation: dict[str, Any],
+) -> None:
+    db = SessionLocal()
+    try:
+        existing_event = db.execute(
+            select(Event).where(
+                Event.session_id == session_id,
+                Event.prompt_index == prompt_index,
+                Event.role == EventRole.AGENT,
+                Event.agent_slot == agent_slot,
+                Event.kind == EventKind.TRANSCRIPT,
+            )
+        ).scalar_one_or_none()
+        if existing_event:
+            return
+
+        provider = get_provider()
+        content = provider.continue_generation(continuation).strip()
+        if not content:
+            content = "The action resolves as described."
+
+        _create_agent_transcript_event(db, session_id, prompt_index, agent_slot, content)
+        log_artifact(
+            db,
+            session_id,
+            f"{agent_id}_continuation",
+            model,
+            agent_payload,
+            content,
+            provider.provider_name,
+        )
+
+        session = get_session_or_404(db, session_id)
+        if prompt_index % settings.chunk_size_prompts == 0 and session.last_summarized_prompt_index < prompt_index:
+            session.state = SessionState.SUMMARIZING
+            _run_summarization(db, session, prompt_index)
+            session.state = SessionState.ACTIVE
+
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "Prompt narration continuation failed: session=%s prompt=%s agent_slot=%s",
+            session_id,
+            prompt_index,
+            agent_slot,
+        )
+    finally:
+        db.close()
+
+
+def prompt_agent(
+    db: Session,
+    session_id: str,
+    agent_slot: int,
+    user_text: str,
+) -> tuple[SessionModel, Event, Event | None, bool, list[Event], dict[str, Any] | None]:
     provider = get_provider()
     session = get_session_or_404(db, session_id)
     if session.state != SessionState.ACTIVE:
@@ -1308,29 +1645,72 @@ def prompt_agent(db: Session, session_id: str, agent_slot: int, user_text: str) 
 
     if agent_slot == OPPOSITION_AGENT_SLOT:
         agent_payload = _build_opposition_payload(db, session, user_text)
-        agent_text_raw = provider.generate("agent12", settings.llm_model_opposition, agent_payload)
-        log_artifact(db, session_id, "agent12", settings.llm_model_opposition, agent_payload, agent_text_raw, provider.provider_name)
+        agent_id = "agent12"
+        agent_model = settings.llm_model_opposition
+        generation = provider.generate_action_response("agent12", settings.llm_model_opposition, agent_payload)
+        log_artifact(
+            db,
+            session_id,
+            agent_id,
+            agent_model,
+            agent_payload,
+            json.dumps(
+                {
+                    "content": generation.content,
+                    "rolls": generation.pending_roll_results,
+                    "actions": generation.pending_action_results,
+                    "state_changes": generation.pending_state_changes,
+                    "narration_pending": generation.narration_pending,
+                },
+                ensure_ascii=True,
+            ),
+            provider.provider_name,
+        )
     else:
         agent_payload = _build_character_payload(db, session, agent_slot, user_text)
-        agent_text_raw = provider.generate("agent_character", settings.llm_model_character, agent_payload)
-        log_artifact(db, session_id, "agent_character", settings.llm_model_character, agent_payload, agent_text_raw, provider.provider_name)
-    agent_text, markers = _strip_markers(agent_text_raw)
-    agent_event = Event(
-        session_id=session_id,
-        prompt_index=session.prompt_index,
-        role=EventRole.AGENT,
-        kind=EventKind.TRANSCRIPT,
-        agent_slot=agent_slot,
-        text=agent_text,
-        json_payload={},
-    )
-    db.add(agent_event)
-    _apply_markers(db, session, agent_slot, session.prompt_index, markers)
+        agent_id = "agent_character"
+        agent_model = settings.llm_model_character
+        generation = provider.generate_action_response("agent_character", settings.llm_model_character, agent_payload)
+        log_artifact(
+            db,
+            session_id,
+            agent_id,
+            agent_model,
+            agent_payload,
+            json.dumps(
+                {
+                    "content": generation.content,
+                    "rolls": generation.pending_roll_results,
+                    "actions": generation.pending_action_results,
+                    "state_changes": generation.pending_state_changes,
+                    "narration_pending": generation.narration_pending,
+                },
+                ensure_ascii=True,
+            ),
+            provider.provider_name,
+        )
+
+    agent_event: Event | None = None
+    continuation_job: dict[str, Any] | None = None
+    if generation.narration_pending:
+        continuation_job = {
+            "session_id": session_id,
+            "prompt_index": session.prompt_index,
+            "agent_slot": agent_slot,
+            "agent_id": agent_id,
+            "model": agent_model,
+            "agent_payload": agent_payload,
+            "continuation": generation.continuation,
+        }
+    else:
+        agent_event = _create_agent_transcript_event(db, session_id, session.prompt_index, agent_slot, generation.content)
+
+    _apply_generation_result(db, session, agent_slot, session.prompt_index, generation)
     _append_system_event(db, session_id, session.prompt_index, EventKind.TURN_ENDED, f"Turn ended for {session.agent_names.get(str(agent_slot), _default_name(agent_slot))}.", {"agent_slot": agent_slot})
     _advance_turn_if_in_combat(session)
 
     summary_triggered = False
-    if session.prompt_index % settings.chunk_size_prompts == 0:
+    if not generation.narration_pending and session.prompt_index % settings.chunk_size_prompts == 0:
         session.state = SessionState.SUMMARIZING
         summary_triggered = _run_summarization(db, session, session.prompt_index)
         session.state = SessionState.ACTIVE
@@ -1339,8 +1719,10 @@ def prompt_agent(db: Session, session_id: str, agent_slot: int, user_text: str) 
     db.commit()
     db.refresh(session)
     db.refresh(user_event)
-    db.refresh(agent_event)
-    return session, user_event, agent_event, summary_triggered
+    if agent_event is not None:
+        db.refresh(agent_event)
+    prompt_events = _prompt_system_events(db, session_id, session.prompt_index)
+    return session, user_event, agent_event, summary_triggered, prompt_events, continuation_job
 
 
 def end_chapter(db: Session, session_id: str) -> SessionModel:
@@ -1386,6 +1768,7 @@ def travel_to_location(db: Session, session_id: str, location_id: str, location_
 
 def take_long_rest(db: Session, session_id: str) -> SessionModel:
     session = get_session_or_404(db, session_id)
+    _ensure_nonblocking_opposition_state(db, session)
     if session.state != SessionState.ACTIVE:
         raise ValueError("Long rest is allowed only in ACTIVE state")
     if (session.opposition_state or {}).get("active"):
@@ -1437,6 +1820,7 @@ def take_long_rest(db: Session, session_id: str) -> SessionModel:
 def spawn_opposition(db: Session, session_id: str, monster_type: str, quantity: int) -> SessionModel:
     session = get_session_or_404(db, session_id)
     tab1 = get_tab1_or_create(db, session_id)
+    _ensure_nonblocking_opposition_state(db, session)
     if session.state != SessionState.ACTIVE:
         raise ValueError("Opposition can only be spawned during ACTIVE play")
     if (session.opposition_state or {}).get("active"):
@@ -1466,6 +1850,7 @@ def spawn_opposition(db: Session, session_id: str, monster_type: str, quantity: 
         "monster_type": monster_type,
         "monster_stats": template,
         "instances": instances,
+        "cleanup_after": "",
     }
     if OPPOSITION_AGENT_SLOT not in session.selected_agent_slots:
         session.selected_agent_slots = [*session.selected_agent_slots, OPPOSITION_AGENT_SLOT]
@@ -1486,6 +1871,7 @@ def spawn_opposition(db: Session, session_id: str, monster_type: str, quantity: 
 
 def dismiss_opposition(db: Session, session_id: str) -> SessionModel:
     session = get_session_or_404(db, session_id)
+    _ensure_nonblocking_opposition_state(db, session)
     if not (session.opposition_state or {}).get("active"):
         raise ValueError("No active Opposition to dismiss")
     _dismiss_opposition_state(db, session, session.prompt_index, reason="manual")
@@ -1899,6 +2285,9 @@ def derive_party_state(db: Session, session_id: str) -> dict[str, dict]:
 
 def get_session_detail(db: Session, session_id: str) -> dict:
     session = get_session_or_404(db, session_id)
+    if _maybe_finalize_opposition_cleanup(db, session):
+        db.commit()
+        session = get_session_or_404(db, session_id)
     tab1 = get_tab1_or_create(db, session_id)
     events = db.execute(select(Event).where(Event.session_id == session_id).order_by(Event.prompt_index.asc(), Event.created_at.asc())).scalars().all()
     memory_blocks = _current_memory_blocks(db, session_id)
