@@ -51,7 +51,8 @@ const TTS_PLAYER_GAIN: Record<string, number> = {
   Jannet: 1.35,
 };
 
-const TUTORIAL_VIDEO_URL = import.meta.env.VITE_TUTORIAL_VIDEO_URL ?? "";
+const DEFAULT_TUTORIAL_VIDEO_URL = "https://www.youtube.com/watch?v=eJarez0LH-E";
+const TUTORIAL_VIDEO_URL = import.meta.env.VITE_TUTORIAL_VIDEO_URL || DEFAULT_TUTORIAL_VIDEO_URL;
 
 function youtubeEmbedUrl(rawUrl: string) {
   const value = rawUrl.trim();
