@@ -92,6 +92,9 @@ export function AdventureTab(props: AdventureTabProps) {
         displayAdventureTitle={props.displayAdventureTitle}
         encounterLocationTitle={props.encounterLocationTitle}
         playedAttackEventIds={props.playedAttackEventIds}
+        latestEligibleReply={props.latestEligibleReply}
+        ttsAutoPlay={props.ttsAutoPlay}
+        ttsState={props.ttsState}
         onAnimationStateChange={props.onAnimationStateChange}
         onAnimationSettled={props.onAnimationSettled}
         onMarkAttackAnimationPlayed={props.onMarkAttackAnimationPlayed}

@@ -951,6 +951,19 @@ export function App() {
                 Tutorial
               </button>
             </div>
+            <div className="mobile-tts-controls">
+              <span className={`tts-status tts-status--${ttsState}`}>AI Voice: {TTS_STATUS_LABELS[ttsState]}</span>
+              <button className="btn music-btn" type="button" onClick={() => void playReply()} disabled={!latestEligibleReply || ttsState === "loading"}>
+                Play
+              </button>
+              <button
+                className={ttsAutoPlay ? "btn music-btn accent-toggle active" : "btn music-btn accent-toggle"}
+                type="button"
+                onClick={toggleTtsAutoPlay}
+              >
+                Auto: {ttsAutoPlay ? "On" : "Off"}
+              </button>
+            </div>
           </div>
         </div>
       </header>

@@ -1,6 +1,6 @@
 import { CSSProperties, useEffect, useMemo, useRef, useState } from "react";
 import { resolveApiUrl } from "../../api";
-import { AdventureLocation, AttackResolvedPayload, Monster, OPPOSITION_SLOT, OppositionState, PartyMember, SessionDetail, SLOT_COLORS } from "../../appTypes";
+import { AdventureLocation, AttackResolvedPayload, Monster, OPPOSITION_SLOT, OppositionState, PartyMember, SessionDetail, SLOT_COLORS, TranscriptEvent, TtsState } from "../../appTypes";
 
 type LocationView = "world" | "adventure" | "encounter";
 
@@ -22,6 +22,9 @@ type LocationCellProps = {
   displayAdventureTitle: (adventure: SessionDetail["tab1"]["active_adventure"]) => string;
   encounterLocationTitle: string;
   playedAttackEventIds: string[];
+  latestEligibleReply: TranscriptEvent | null;
+  ttsAutoPlay: boolean;
+  ttsState: TtsState;
   onAnimationStateChange: (locked: boolean) => void;
   onAnimationSettled: () => Promise<SessionDetail>;
   onMarkAttackAnimationPlayed: (eventId: string) => void;
@@ -72,6 +75,17 @@ type AttackOverlayScene = {
   players: OverlayPlayerCard[];
   monsters: OverlayMonsterCard[];
 };
+
+type SpeakingHold = {
+  slot: number;
+  promptIndex: number;
+  source: "narration";
+};
+
+const COMBAT_ANIMATION_MS = 5000;
+// Start timing when TTS playback begins. A small cushion makes the visual read
+// as a full 10 seconds after browser/audio startup jitter.
+const NARRATION_SPEAKING_HOLD_MS = 12000;
 
 function hpLossPercent(current: number, max: number) {
   if (max <= 0) return 100;
@@ -283,14 +297,20 @@ export function LocationCell({
   displayAdventureTitle,
   encounterLocationTitle,
   playedAttackEventIds,
+  latestEligibleReply,
+  ttsAutoPlay,
+  ttsState,
   onAnimationStateChange,
   onAnimationSettled,
   onMarkAttackAnimationPlayed,
 }: LocationCellProps) {
   const [activeOverlayScene, setActiveOverlayScene] = useState<AttackOverlayScene | null>(null);
+  const [speakingHold, setSpeakingHold] = useState<SpeakingHold | null>(null);
   const previousOppositionEntriesRef = useRef<DisplayOppositionEntry[]>([]);
   const fadeTimerRef = useRef<number | null>(null);
   const animationTimerRef = useRef<number | null>(null);
+  const speakingHoldTimerRef = useRef<number | null>(null);
+  const lastNarrationHoldEventIdRef = useRef("");
   const activeSceneKeyRef = useRef("");
   const selectedLocation = adventureLocations.find((location) => location.id === activeLocation?.id) ?? null;
   const missionObjective = detail.session.mission_objective_state;
@@ -324,6 +344,16 @@ export function LocationCell({
     }
     return uniqueSlots.map((slot) => playerBySlot.get(slot)!);
   }, [activeAgentSlot, detail.session.combat_state.in_combat, detail.session.combat_state.initiative_order, detail.tab1.party, detail.tab1.selected_agent_slots]);
+
+  useEffect(() => {
+    if (!ttsAutoPlay) {
+      if (speakingHoldTimerRef.current) {
+        window.clearTimeout(speakingHoldTimerRef.current);
+        speakingHoldTimerRef.current = null;
+      }
+      setSpeakingHold(null);
+    }
+  }, [ttsAutoPlay]);
 
   useEffect(() => {
     const previousEntries = previousOppositionEntriesRef.current;
@@ -376,8 +406,39 @@ export function LocationCell({
           }
           onAnimationStateChange(false);
         });
-    }, 5000);
+    }, COMBAT_ANIMATION_MS);
   }, [activeOverlayScene, latestAttackSelection.staleEventIds, nextOverlayScene, onAnimationSettled, onAnimationStateChange, onMarkAttackAnimationPlayed]);
+
+  useEffect(() => {
+    if (!ttsAutoPlay || ttsState !== "playing" || !latestEligibleReply?.event_id || latestEligibleReply.role !== "agent") {
+      return;
+    }
+    if (!latestEligibleReply.agent_slot || latestEligibleReply.agent_slot === OPPOSITION_SLOT) {
+      return;
+    }
+    if (latestEligibleReply.prompt_index !== detail.session.prompt_index) {
+      return;
+    }
+    if (lastNarrationHoldEventIdRef.current === latestEligibleReply.event_id) {
+      return;
+    }
+    lastNarrationHoldEventIdRef.current = latestEligibleReply.event_id;
+    if (speakingHoldTimerRef.current) {
+      window.clearTimeout(speakingHoldTimerRef.current);
+    }
+    const holdSlot = latestEligibleReply.agent_slot;
+    setSpeakingHold({
+      slot: holdSlot,
+      promptIndex: latestEligibleReply.prompt_index,
+      source: "narration",
+    });
+    speakingHoldTimerRef.current = window.setTimeout(() => {
+      speakingHoldTimerRef.current = null;
+      setSpeakingHold((current) => (
+        current?.slot === holdSlot && current.source === "narration" ? null : current
+      ));
+    }, NARRATION_SPEAKING_HOLD_MS);
+  }, [detail.session.prompt_index, latestEligibleReply, ttsAutoPlay, ttsState]);
 
   useEffect(() => () => {
     if (fadeTimerRef.current) {
@@ -386,6 +447,9 @@ export function LocationCell({
     if (animationTimerRef.current) {
       window.clearTimeout(animationTimerRef.current);
     }
+    if (speakingHoldTimerRef.current) {
+      window.clearTimeout(speakingHoldTimerRef.current);
+    }
     activeSceneKeyRef.current = "";
     onAnimationStateChange(false);
   }, [onAnimationStateChange]);
@@ -393,6 +457,11 @@ export function LocationCell({
   function playerIsOverlayHidden(slot: number) {
     if (!activeOverlayScene) return false;
     return activeOverlayScene.players.some((entry) => entry.slot === slot);
+  }
+
+  function playerIsSpeakingHeld(slot: number) {
+    if (!speakingHold || activeOverlayScene) return false;
+    return speakingHold.slot === slot;
   }
 
   function monsterIsOverlayHidden(monsterId: string) {
@@ -413,7 +482,13 @@ export function LocationCell({
         <button className={locationView === "encounter" ? "tab active" : "tab"} type="button" onClick={() => onSetLocationView("encounter")}>Encounter Location</button>
       </div>
 
-      <div className="location-stage">
+      <div
+        className={[
+          "location-stage",
+          `location-stage--${locationView}`,
+          locationView === "adventure" && selectedLocation ? "location-stage--travel-open" : "",
+        ].filter(Boolean).join(" ")}
+      >
         {locationView === "world" && (
           <div className="location-map-shell">
             <img className="location-map-image" src={resolveApiUrl(worldMapImageUrl)} alt="Valaska world map" />
@@ -498,7 +573,7 @@ export function LocationCell({
                   className={[
                     "initiative-card",
                     "initiative-card--player",
-                    playerIsOverlayHidden(member.slot) ? "initiative-card--concealed" : "",
+                    playerIsOverlayHidden(member.slot) || playerIsSpeakingHeld(member.slot) ? "initiative-card--concealed" : "",
                     activeAgentSlot === member.slot ? "active" : "",
                   ].filter(Boolean).join(" ")}
                   style={{
@@ -521,8 +596,28 @@ export function LocationCell({
           </div>
         )}
 
+        {speakingHold && !activeOverlayScene && (() => {
+          const heldMember = detail.tab1.party.find((member) => member.slot === speakingHold.slot);
+          if (!heldMember) return null;
+          const hpLoss = hpLossPercent(heldMember.hp_current, heldMember.hp_max);
+          return (
+            <div
+              className="initiative-card initiative-card--player initiative-card--speaking-hold active"
+              style={{ borderColor: SLOT_COLORS[heldMember.slot] }}
+            >
+              <img src={resolveApiUrl(heldMember.portrait_url)} alt={heldMember.player_name} />
+              <div className="initiative-card-overlay" style={{ height: `${hpLoss}%` }} />
+              <div className="initiative-card-meta">
+                <strong>{heldMember.player_name}</strong>
+                <span>Speaking</span>
+                <span>HP {heldMember.hp_current}/{heldMember.hp_max}</span>
+              </div>
+            </div>
+          );
+        })()}
+
         {liveOppositionEntries.length > 0 && (
-          <div className={liveOppositionEntries.length > 1 ? "opposition-group-shell" : ""}>
+          <div className={liveOppositionEntries.length > 1 ? "opposition-group-shell opposition-group-shell--multi" : "opposition-group-shell"}>
             {liveOppositionEntries.map((entry, index) => (
               <div
                 key={`${entry.monsterId}${entry.isDying ? "-dying" : ""}`}

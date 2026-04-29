@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { resolveApiUrl } from "../api";
 import { Adventure, AdventureSummary, CatalogBoot, SessionDetail } from "../appTypes";
 
@@ -107,12 +107,145 @@ export function PreparationTab({
   displayAdventureTitle,
 }: PreparationTabProps) {
   const [hoveredAdventureId, setHoveredAdventureId] = useState("");
+  const [mobileStep, setMobileStep] = useState<"mission" | "party">("mission");
+  const chapterLoadingRef = useRef<HTMLParagraphElement | null>(null);
   const hoveredAdventure = catalogBoot.adventures.find((adventure) => adventure.adventure_id === hoveredAdventureId) ?? null;
   const displayedAdventure = hoveredAdventure ?? selectedAdventureSummary ?? null;
 
+  useEffect(() => {
+    if (!adventureId) {
+      setMobileStep("mission");
+    }
+  }, [adventureId]);
+
+  useEffect(() => {
+    if (!chapterStarting) return;
+    window.requestAnimationFrame(() => {
+      chapterLoadingRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
+  }, [chapterStarting]);
+
   return (
     <section className="panel">
-      <div className="panel-grid panel-grid--tab1-phase1">
+      <div className="mobile-prep-flow">
+        {mobileStep === "mission" && (
+          <article className="card map-card map-card--mission">
+            <div className="card-head">
+              <span>Preparation</span>
+              <h2>{selectedAdventureSummary ? "Confirm Mission" : "Choose a Mission"}</h2>
+            </div>
+
+            {!selectedAdventureSummary && (
+              <div className="setting-map-shell">
+                <img className="media setting-map-image" src={resolveApiUrl(catalogBoot.map_image_url)} alt="Valaska setting map" />
+                {catalogBoot.adventures.map((adventure, index) => {
+                  const position = MISSION_PIP_POSITIONS[adventure.adventure_id];
+                  if (!position) return null;
+                  return (
+                    <button
+                      key={adventure.adventure_id}
+                      type="button"
+                      className="map-pip"
+                      style={{ left: `${position.left}%`, top: `${position.top}%` }}
+                      onClick={() => setAdventureId(adventure.adventure_id)}
+                      aria-label={`${index + 1}. ${displayAdventureTitle(adventure)}`}
+                    >
+                      {index + 1}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+
+            {selectedAdventureSummary && (
+              <div className="mobile-mission-preview">
+                <img
+                  src={resolveApiUrl(ADVENTURE_PREVIEW_IMAGES[selectedAdventureSummary.adventure_id] ?? catalogBoot.default_image_url)}
+                  alt={displayAdventureTitle(selectedAdventureSummary)}
+                />
+                <div className="mobile-mission-preview-copy">
+                  <strong>{displayAdventureTitle(selectedAdventure ?? selectedAdventureSummary)}</strong>
+                  <p>
+                    {selectedAdventure
+                      ? selectedAdventure.objectives.map((objective) => objective.description).join(" | ")
+                      : selectedAdventureSummary.description}
+                  </p>
+                </div>
+                <div className="mobile-preview-actions">
+                  <button className="btn" type="button" onClick={() => setAdventureId("")}>Return</button>
+                  <button className="btn accent" type="button" onClick={() => setMobileStep("party")}>Accept</button>
+                </div>
+              </div>
+            )}
+          </article>
+        )}
+
+        {mobileStep === "party" && (
+          <article className="card mobile-party-card">
+            <div className="card-head">
+              <span>Build the Party</span>
+              <h2>Select Four Players</h2>
+              <small>{selectedPlayerIds.length}/4</small>
+            </div>
+            <div className="mobile-party-grid">
+              {catalogBoot.players.map((player) => {
+                const selected = selectedPlayerIds.includes(player.player_id);
+                const selectedClassId = classByPlayer[player.player_id] ?? "";
+                const savedPortrait = detail.tab1.party.find((member) => member.player_id === player.player_id)?.portrait_url ?? player.image_url;
+                return (
+                  <div
+                    key={player.player_id}
+                    className={selected ? "mobile-player-card selected" : "mobile-player-card"}
+                    onClick={() => onTogglePlayer(player.player_id)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        onTogglePlayer(player.player_id);
+                      }
+                    }}
+                    role="button"
+                    tabIndex={0}
+                  >
+                    <PortraitTileImage
+                      playerId={player.player_id}
+                      classId={selected && selectedClassId ? selectedClassId : null}
+                      fallbackUrl={resolveApiUrl(savedPortrait)}
+                      alt={player.name}
+                    />
+                    <strong>{player.name}</strong>
+                    {selected && (
+                      <select
+                        value={selectedClassId}
+                        onClick={(event) => event.stopPropagation()}
+                        onChange={(event) => onSetPlayerClass(player.player_id, event.target.value)}
+                      >
+                        <option value="">Class</option>
+                        {catalogBoot.classes.map((classItem) => (
+                          <option key={classItem.class_id} value={classItem.class_id}>
+                            {classItem.name}
+                          </option>
+                        ))}
+                      </select>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+            <div className="mobile-preview-actions">
+              <button className="btn" type="button" onClick={() => setMobileStep("mission")}>Mission</button>
+              {!detail.session.tab1_locked && (
+                <span className="button-tooltip-wrap" title={loading || startReady ? "" : startChapterHint}>
+                  <button className="btn accent" type="button" onClick={onStartChapter} disabled={loading || !startReady}>Start Chapter</button>
+                </span>
+              )}
+              {detail.session.tab1_locked && <button className="btn danger" type="button" onClick={onResetChapter} disabled={loading}>Reset Chapter</button>}
+            </div>
+            {!detail.session.tab1_locked && !startReady && <p className="inline-guidance">{startChapterHint}</p>}
+          </article>
+        )}
+      </div>
+
+      <div className="panel-grid panel-grid--tab1-phase1 desktop-prep-flow">
         <article className="card map-card map-card--mission">
           <div className="card-head">
             <span>Preparation</span>
@@ -211,7 +344,7 @@ export function PreparationTab({
       </div>
 
       {selectedAdventureSummary && (
-        <div className="summary-bar">
+        <div className="summary-bar desktop-prep-flow">
           <strong>{displayAdventureTitle(selectedAdventure ?? selectedAdventureSummary)}</strong>
           <span>
             {selectedAdventure
@@ -221,7 +354,7 @@ export function PreparationTab({
         </div>
       )}
 
-      <div className="action-row">
+      <div className="action-row desktop-prep-flow">
         <button className="btn" onClick={onSaveTab1} disabled={loading}>Save Page</button>
         {!detail.session.tab1_locked && (
           <span className="button-tooltip-wrap" title={loading || startReady ? "" : startChapterHint}>
@@ -230,8 +363,13 @@ export function PreparationTab({
         )}
         {detail.session.tab1_locked && <button className="btn danger" onClick={onResetChapter} disabled={loading}>Reset Chapter</button>}
       </div>
-      {chapterStarting && <p className="chapter-loading-notice">Preparing Adventure{loadingPulse}</p>}
-      {!detail.session.tab1_locked && !startReady && <p className="inline-guidance">{startChapterHint}</p>}
+      {chapterStarting && (
+        <p className="chapter-loading-notice" ref={chapterLoadingRef}>
+          <span>Preparing Adventure</span>
+          <span className="chapter-loading-dots">{loadingPulse}</span>
+        </p>
+      )}
+      {!detail.session.tab1_locked && !startReady && <p className="inline-guidance desktop-prep-flow">{startChapterHint}</p>}
     </section>
   );
 }

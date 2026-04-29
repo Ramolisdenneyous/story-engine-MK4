@@ -82,7 +82,7 @@ export function GmPromptPanel({
           <span>Guide the Party</span>
           <h2>Game Master Prompting</h2>
         </div>
-        <div className="agent-tabs">
+        <div className={activeOpposition?.active ? "agent-tabs agent-tabs--combat" : "agent-tabs"}>
           {detail.tab1.party.map((member) => {
             const disabled = member.hp_current <= 0 || animationLocked;
             return (
@@ -127,15 +127,18 @@ export function GmPromptPanel({
           />
           {activeMemberIsDown && <p className="inline-guidance">That agent is at 0 HP and cannot be prompted until they are healed.</p>}
           {animationLocked && <p className="inline-guidance">Resolving combat animation...</p>}
-          <div className="party-summary-list">
-            {detail.tab1.party.map((member) => (
-              <div key={member.slot} className={member.hp_current <= 0 ? "party-summary-chip disabled" : "party-summary-chip"}>
-                <strong>{member.player_name}</strong>
-                <span>HP {member.hp_current}/{member.hp_max}</span>
-                <span>{member.inventory.length ? member.inventory.join(", ") : "No listed inventory"}</span>
-              </div>
-            ))}
-          </div>
+          <details className="mobile-party-details">
+            <summary>Party Status</summary>
+            <div className="party-summary-list">
+              {detail.tab1.party.map((member) => (
+                <div key={member.slot} className={member.hp_current <= 0 ? "party-summary-chip disabled" : "party-summary-chip"}>
+                  <strong>{member.player_name}</strong>
+                  <span>HP {member.hp_current}/{member.hp_max}</span>
+                  <span>{member.inventory.length ? member.inventory.join(", ") : "No listed inventory"}</span>
+                </div>
+              ))}
+            </div>
+          </details>
           <div className="action-row">
             <button className="btn" type="submit" disabled={loading || !canPrompt}>Send Prompt</button>
             <button
