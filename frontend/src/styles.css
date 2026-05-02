@@ -473,6 +473,36 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   filter: brightness(1.04);
 }
 
+.onboarding-guide-pulse {
+  border-color: rgba(255, 208, 84, 0.96) !important;
+  box-shadow:
+    0 0 0 2px rgba(255, 208, 84, 0.42),
+    0 0 18px rgba(255, 195, 48, 0.86),
+    0 0 34px rgba(255, 149, 30, 0.48) !important;
+  animation: onboardingGuidePulse 2.2s ease-in-out infinite;
+}
+
+.starter-prompt-bubble.onboarding-guide-pulse {
+  background: linear-gradient(135deg, rgba(255, 214, 99, 0.96), rgba(255, 174, 70, 0.96));
+}
+
+@keyframes onboardingGuidePulse {
+  0%, 100% {
+    box-shadow:
+      0 0 0 2px rgba(255, 208, 84, 0.34),
+      0 0 14px rgba(255, 195, 48, 0.68),
+      0 0 28px rgba(255, 149, 30, 0.38);
+    filter: brightness(1);
+  }
+  50% {
+    box-shadow:
+      0 0 0 4px rgba(255, 226, 124, 0.56),
+      0 0 26px rgba(255, 211, 79, 0.98),
+      0 0 48px rgba(255, 159, 41, 0.62);
+    filter: brightness(1.08);
+  }
+}
+
 .split-row { justify-content: space-between; }
 .end-button { margin-left: auto; }
 .dice-result { margin: 0; color: var(--text-muted); }

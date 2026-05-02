@@ -13,6 +13,7 @@ import { GmPromptPanel } from "./adventure/GmPromptPanel";
 import { LocationCell } from "./adventure/LocationCell";
 
 type LocationView = "world" | "adventure" | "encounter";
+type OnboardingGuideStep = "starter" | "adventure-map" | "location-one" | "travel" | "trigger-encounter" | "start-encounter" | "opposition-prompt" | "complete";
 
 type AdventureTabProps = {
   detail: SessionDetail;
@@ -44,6 +45,7 @@ type AdventureTabProps = {
   encounterImageUrl: string;
   encounterLocationTitle: string;
   locationView: LocationView;
+  onboardingGuideStep: OnboardingGuideStep;
   playedAttackEventIds: string[];
   animationLocked: boolean;
   onPlayReply: () => void;
@@ -88,6 +90,7 @@ export function AdventureTab(props: AdventureTabProps) {
         activeOpposition={props.locationOppositionState}
         travelLoading={props.travelLoading}
         locationView={props.locationView}
+        onboardingGuideStep={props.onboardingGuideStep}
         onSetActiveLocationId={props.onSetActiveLocationId}
         onSetLocationView={props.onSetLocationView}
         onTravelToSelectedLocation={props.onTravelToSelectedLocation}
@@ -134,6 +137,7 @@ export function AdventureTab(props: AdventureTabProps) {
         onSubmitPrompt={props.onSubmitPrompt}
         onSetUserPrompt={props.onSetUserPrompt}
         starterPromptText={props.starterPromptText}
+        onboardingGuideStep={props.onboardingGuideStep}
         onSubmitStarterPrompt={props.onSubmitStarterPrompt}
         onDismissStarterPrompt={props.onDismissStarterPrompt}
         onTakeLongRest={props.onTakeLongRest}

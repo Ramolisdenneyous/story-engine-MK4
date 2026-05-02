@@ -2,6 +2,8 @@ import { FormEvent } from "react";
 import { resolveApiUrl } from "../../api";
 import { Monster, OPPOSITION_SLOT, OppositionState, SessionDetail, SLOT_COLORS } from "../../appTypes";
 
+type OnboardingGuideStep = "starter" | "adventure-map" | "location-one" | "travel" | "trigger-encounter" | "start-encounter" | "opposition-prompt" | "complete";
+
 type GmPromptPanelProps = {
   detail: SessionDetail;
   activeAgentSlot: number;
@@ -20,6 +22,7 @@ type GmPromptPanelProps = {
   onSubmitPrompt: (event: FormEvent) => void;
   onSetUserPrompt: (value: string) => void;
   starterPromptText: string;
+  onboardingGuideStep: OnboardingGuideStep;
   onSubmitStarterPrompt: () => void;
   onDismissStarterPrompt: () => void;
   onTakeLongRest: () => void;
@@ -58,6 +61,7 @@ export function GmPromptPanel({
   onSubmitPrompt,
   onSetUserPrompt,
   starterPromptText,
+  onboardingGuideStep,
   onSubmitStarterPrompt,
   onDismissStarterPrompt,
   onTakeLongRest,
@@ -81,6 +85,8 @@ export function GmPromptPanel({
     && (activeAgentSlot !== OPPOSITION_SLOT || Boolean(activeOpposition?.active));
   const encounterButtonLabel = activeOpposition?.active ? "Flee Encounter" : "Trigger Encounter";
   const showStarterPrompt = Boolean(starterPromptText && canPrompt && !userPrompt.trim() && !loading);
+  const triggerEncounterGuideActive = onboardingGuideStep === "trigger-encounter" && !activeOpposition?.active;
+  const startEncounterGuideActive = onboardingGuideStep === "start-encounter";
 
   return (
     <>
@@ -140,7 +146,7 @@ export function GmPromptPanel({
             />
             {showStarterPrompt && (
               <button
-                className="starter-prompt-bubble"
+                className={["starter-prompt-bubble", onboardingGuideStep === "starter" || onboardingGuideStep === "opposition-prompt" ? "onboarding-guide-pulse" : ""].filter(Boolean).join(" ")}
                 type="button"
                 onClick={(event) => {
                   event.stopPropagation();
@@ -168,7 +174,10 @@ export function GmPromptPanel({
           <div className="action-row">
             <button className="btn" type="submit" disabled={loading || !canPrompt}>Send Prompt</button>
             <button
-              className={activeOpposition?.active ? "btn danger" : "btn accent"}
+              className={[
+                activeOpposition?.active ? "btn danger" : "btn accent",
+                triggerEncounterGuideActive ? "onboarding-guide-pulse" : "",
+              ].filter(Boolean).join(" ")}
               type="button"
               onClick={activeOpposition?.active ? onFleeEncounter : onOpenEncounterModal}
               disabled={loading || animationLocked || (!activeOpposition?.active && gmMonsters.length === 0)}
@@ -242,7 +251,14 @@ export function GmPromptPanel({
             )}
             <div className="action-row">
               <button className="btn" type="button" onClick={onCloseEncounterModal}>Cancel</button>
-              <button className="btn accent" type="button" onClick={onTriggerEncounter} disabled={!selectedEncounterMonster || loading}>Start Encounter</button>
+              <button
+                className={startEncounterGuideActive ? "btn accent onboarding-guide-pulse" : "btn accent"}
+                type="button"
+                onClick={onTriggerEncounter}
+                disabled={!selectedEncounterMonster || loading}
+              >
+                Start Encounter
+              </button>
             </div>
           </div>
         </div>

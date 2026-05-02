@@ -18,7 +18,7 @@ type PreparationTabProps = {
   loadingPulse: string;
   onTogglePlayer: (playerId: string) => void;
   onSetPlayerClass: (playerId: string, classId: string) => void;
-  onSaveTab1: () => void;
+  onApplyRecommendedParty: () => void;
   onStartChapter: () => void;
   onResetChapter: () => void;
   displayAdventureTitle: (adventure: AdventureSummary | Adventure | null) => string;
@@ -101,7 +101,7 @@ export function PreparationTab({
   loadingPulse,
   onTogglePlayer,
   onSetPlayerClass,
-  onSaveTab1,
+  onApplyRecommendedParty,
   onStartChapter,
   onResetChapter,
   displayAdventureTitle,
@@ -234,6 +234,9 @@ export function PreparationTab({
             <div className="mobile-preview-actions">
               <button className="btn" type="button" onClick={() => setMobileStep("mission")}>Mission</button>
               {!detail.session.tab1_locked && (
+                <button className="btn" type="button" onClick={onApplyRecommendedParty} disabled={loading}>Recommended Party</button>
+              )}
+              {!detail.session.tab1_locked && (
                 <span className="button-tooltip-wrap" title={loading || startReady ? "" : startChapterHint}>
                   <button className="btn accent" type="button" onClick={onStartChapter} disabled={loading || !startReady}>Start Chapter</button>
                 </span>
@@ -355,7 +358,7 @@ export function PreparationTab({
       )}
 
       <div className="action-row desktop-prep-flow">
-        <button className="btn" onClick={onSaveTab1} disabled={loading}>Save Page</button>
+        <button className="btn" onClick={onApplyRecommendedParty} disabled={loading || detail.session.tab1_locked}>Recommended Party</button>
         {!detail.session.tab1_locked && (
           <span className="button-tooltip-wrap" title={loading || startReady ? "" : startChapterHint}>
             <button className="btn accent" onClick={onStartChapter} disabled={loading || !startReady}>Start Chapter</button>

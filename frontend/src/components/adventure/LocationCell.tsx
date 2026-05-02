@@ -3,6 +3,7 @@ import { resolveApiUrl } from "../../api";
 import { AdventureLocation, AttackResolvedPayload, Monster, OPPOSITION_SLOT, OppositionState, PartyMember, SessionDetail, SLOT_COLORS, TranscriptEvent, TtsState } from "../../appTypes";
 
 type LocationView = "world" | "adventure" | "encounter";
+type OnboardingGuideStep = "starter" | "adventure-map" | "location-one" | "travel" | "trigger-encounter" | "start-encounter" | "opposition-prompt" | "complete";
 
 type LocationCellProps = {
   detail: SessionDetail;
@@ -15,6 +16,7 @@ type LocationCellProps = {
   activeOpposition: OppositionState | null;
   travelLoading: boolean;
   locationView: LocationView;
+  onboardingGuideStep: OnboardingGuideStep;
   onSetActiveLocationId: (locationId: string) => void;
   onSetLocationView: (view: LocationView) => void;
   onTravelToSelectedLocation: () => void;
@@ -290,6 +292,7 @@ export function LocationCell({
   activeOpposition,
   travelLoading,
   locationView,
+  onboardingGuideStep,
   onSetActiveLocationId,
   onSetLocationView,
   onTravelToSelectedLocation,
@@ -478,7 +481,16 @@ export function LocationCell({
 
       <div className="location-tabs">
         <button className={locationView === "world" ? "tab active" : "tab"} type="button" onClick={() => onSetLocationView("world")}>World Map</button>
-        <button className={locationView === "adventure" ? "tab active" : "tab"} type="button" onClick={() => onSetLocationView("adventure")}>Adventure Map</button>
+        <button
+          className={[
+            locationView === "adventure" ? "tab active" : "tab",
+            onboardingGuideStep === "adventure-map" ? "onboarding-guide-pulse" : "",
+          ].filter(Boolean).join(" ")}
+          type="button"
+          onClick={() => onSetLocationView("adventure")}
+        >
+          Adventure Map
+        </button>
         <button className={locationView === "encounter" ? "tab active" : "tab"} type="button" onClick={() => onSetLocationView("encounter")}>Encounter Location</button>
       </div>
 
@@ -532,6 +544,7 @@ export function LocationCell({
                     "gm-map-hotspot",
                     activeLocation?.id === location.id ? "active" : "",
                     travelLocked ? "locked" : "",
+                    onboardingGuideStep === "location-one" && location.number === 1 ? "onboarding-guide-pulse" : "",
                   ].filter(Boolean).join(" ")}
                   style={{ left: `${location.x_pct}%`, top: `${location.y_pct}%` }}
                   onClick={() => {
@@ -548,7 +561,12 @@ export function LocationCell({
             {selectedLocation && (
               <div className="travel-popover" style={{ left: `${selectedLocation.x_pct}%`, top: `${selectedLocation.y_pct}%` }}>
                 <strong>{selectedLocation.title}</strong>
-                <button className="btn btn-small accent" type="button" onClick={onTravelToSelectedLocation} disabled={travelLoading}>
+                <button
+                  className={onboardingGuideStep === "travel" ? "btn btn-small accent onboarding-guide-pulse" : "btn btn-small accent"}
+                  type="button"
+                  onClick={onTravelToSelectedLocation}
+                  disabled={travelLoading}
+                >
                   {travelLoading ? "Traveling..." : "Travel"}
                 </button>
               </div>

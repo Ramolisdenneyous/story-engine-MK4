@@ -53,8 +53,10 @@ const TTS_PLAYER_GAIN: Record<string, number> = {
 };
 
 const STARTER_PROMPT = "Party leader, you know this mission, what is your plan?";
+const OPPOSITION_STARTER_PROMPT = "The monster gets the drop on the party, and attacks!";
 const DEFAULT_TUTORIAL_VIDEO_URL = "https://www.youtube.com/watch?v=eJarez0LH-E";
 const TUTORIAL_VIDEO_URL = import.meta.env.VITE_TUTORIAL_VIDEO_URL || DEFAULT_TUTORIAL_VIDEO_URL;
+type OnboardingGuideStep = "starter" | "adventure-map" | "location-one" | "travel" | "trigger-encounter" | "start-encounter" | "opposition-prompt" | "complete";
 
 function youtubeEmbedUrl(rawUrl: string) {
   const value = rawUrl.trim();
@@ -206,6 +208,7 @@ export function App() {
   const [animationLocked, setAnimationLocked] = useState(false);
   const [promptNarrationPending, setPromptNarrationPending] = useState(false);
   const [introAudioPlayed, setIntroAudioPlayed] = useState(false);
+  const [onboardingGuideStep, setOnboardingGuideStep] = useState<OnboardingGuideStep>("starter");
   const [splashOpen, setSplashOpen] = useState(() => window.localStorage.getItem("story-engine-mk4-splash-seen") !== "true");
 
   async function refresh(id = sessionId) {
@@ -662,6 +665,16 @@ export function App() {
     setClassByPlayer((current) => ({ ...current, [playerId]: classId }));
   }
 
+  function applyRecommendedParty() {
+    setSelectedPlayerIds(["Joe", "Annie", "Tammey", "Rick"]);
+    setClassByPlayer({
+      Joe: "Fighter",
+      Annie: "Rogue",
+      Tammey: "Cleric",
+      Rick: "Ranger",
+    });
+  }
+
   const startReady =
     adventureId !== "" &&
     selectedPlayerIds.length === 4 &&
@@ -769,10 +782,35 @@ export function App() {
 
   async function submitStarterPrompt() {
     if (!detail) return;
+    if (onboardingGuideStep === "opposition-prompt") {
+      setActiveAgentSlot(OPPOSITION_SLOT);
+      setOnboardingGuideStep("complete");
+      await sendPromptToAgent(OPPOSITION_SLOT, OPPOSITION_STARTER_PROMPT);
+      return;
+    }
     const firstPlayerSlot = detail.tab1.selected_agent_slots.find((slot) => slot !== OPPOSITION_SLOT) ?? detail.tab1.party[0]?.slot ?? 1;
     setActiveAgentSlot(firstPlayerSlot);
     setStarterPromptDismissed(true);
+    setOnboardingGuideStep((current) => (current === "starter" ? "adventure-map" : current));
     await sendPromptToAgent(firstPlayerSlot, STARTER_PROMPT);
+  }
+
+  function dismissOnboardingGuide() {
+    setOnboardingGuideStep("complete");
+  }
+
+  function setGuidedLocationView(view: "world" | "adventure" | "encounter") {
+    setLocationView(view);
+    setOnboardingGuideStep((current) => (current === "adventure-map" && view === "adventure" ? "location-one" : current));
+  }
+
+  function setGuidedActiveLocationId(locationId: string) {
+    setActiveLocationId(locationId);
+    setOnboardingGuideStep((current) => {
+      if (current !== "location-one") return current;
+      const selectedLocationNumber = adventureLocations.find((location) => location.id === locationId)?.number;
+      return selectedLocationNumber === 1 ? "travel" : "complete";
+    });
   }
 
   async function endChapter() {
@@ -807,6 +845,11 @@ export function App() {
   async function travelToSelectedLocation() {
     if (!sessionId || !activeLocation) return;
     const traveledLocationTitle = activeLocation.title;
+    setOnboardingGuideStep((current) => {
+      if (current === "travel" && activeLocation.number === 1) return "trigger-encounter";
+      if (current !== "complete") return "complete";
+      return current;
+    });
     setTravelLoading(true);
     setError("");
     try {
@@ -858,6 +901,7 @@ export function App() {
 
   async function triggerEncounter() {
     if (!sessionId || !selectedEncounterMonster) return;
+    const continueGuideToOppositionPrompt = onboardingGuideStep === "start-encounter";
     setSpawnLoading(true);
     setError("");
     try {
@@ -872,6 +916,11 @@ export function App() {
       setEncounterModalOpen(false);
       setLocationView("encounter");
       setActiveAgentSlot(activeOpposition?.active ? activeAgentSlot : (refreshed.session.opposition_state?.active ? OPPOSITION_SLOT : activeAgentSlot));
+      setOnboardingGuideStep((current) => (
+        continueGuideToOppositionPrompt && current === "start-encounter" && refreshed.session.opposition_state?.active
+          ? "opposition-prompt"
+          : "complete"
+      ));
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -922,6 +971,7 @@ export function App() {
       setPlayedAttackEventIds([]);
       setStarterPromptDismissed(false);
       setIntroAudioPlayed(false);
+      setOnboardingGuideStep("starter");
       await refresh();
       setTab(1);
     } catch (e) {
@@ -956,6 +1006,18 @@ export function App() {
     && !promptNarrationPending
     && !starterPromptDismissed,
   );
+  const showOppositionStarterPrompt = Boolean(
+    detail.session.state === "ACTIVE"
+    && onboardingGuideStep === "opposition-prompt"
+    && activeOpposition?.active
+    && activeAgentSlot === OPPOSITION_SLOT
+    && !userPrompt.trim()
+    && !promptNarrationPending,
+  );
+  const activeOnboardingGuideStep = showStarterPrompt || showOppositionStarterPrompt || onboardingGuideStep !== "starter" ? onboardingGuideStep : "complete";
+  const starterPromptText = showOppositionStarterPrompt
+    ? OPPOSITION_STARTER_PROMPT
+    : (showStarterPrompt ? STARTER_PROMPT : "");
 
   return (
     <div className="page">
@@ -1066,7 +1128,7 @@ export function App() {
           loadingPulse={loadingPulse}
           onTogglePlayer={togglePlayer}
           onSetPlayerClass={setPlayerClass}
-          onSaveTab1={() => void saveTab1()}
+          onApplyRecommendedParty={applyRecommendedParty}
           onStartChapter={() => void startChapter()}
           onResetChapter={() => void resetChapter()}
           displayAdventureTitle={displayAdventureTitle}
@@ -1105,6 +1167,7 @@ export function App() {
             encounterImageUrl={encounterLocationImageUrl}
             encounterLocationTitle={encounterLocationTitle}
             locationView={locationView}
+            onboardingGuideStep={activeOnboardingGuideStep}
             playedAttackEventIds={playedAttackEventIds}
             animationLocked={animationLocked}
             onPlayReply={() => void playReply()}
@@ -1118,17 +1181,23 @@ export function App() {
             onToggleTtsAutoPlay={toggleTtsAutoPlay}
             onSubmitPrompt={submitPrompt}
             onSetUserPrompt={setUserPrompt}
-            starterPromptText={showStarterPrompt ? STARTER_PROMPT : ""}
+            starterPromptText={starterPromptText}
             onSubmitStarterPrompt={() => void submitStarterPrompt()}
-            onDismissStarterPrompt={() => setStarterPromptDismissed(true)}
+            onDismissStarterPrompt={() => {
+              setStarterPromptDismissed(true);
+              dismissOnboardingGuide();
+            }}
             onSetActiveAgentSlot={setActiveAgentSlot}
             onTakeLongRest={() => void takeLongRest()}
             onEndChapter={() => void endChapter()}
-            onSetLocationView={setLocationView}
-            onSetActiveLocationId={setActiveLocationId}
+            onSetLocationView={setGuidedLocationView}
+            onSetActiveLocationId={setGuidedActiveLocationId}
             onTravelToSelectedLocation={() => void travelToSelectedLocation()}
             onReturnToMoosehearth={() => void returnToMoosehearth()}
-            onOpenEncounterModal={() => setEncounterModalOpen(true)}
+            onOpenEncounterModal={() => {
+              setEncounterModalOpen(true);
+              setOnboardingGuideStep((current) => (current === "trigger-encounter" ? "start-encounter" : "complete"));
+            }}
             onCloseEncounterModal={() => setEncounterModalOpen(false)}
             onSetEncounterMonsterId={setEncounterMonsterId}
             onCycleEncounterMonster={cycleEncounterMonster}
